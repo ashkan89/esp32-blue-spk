@@ -3,3 +3,12 @@
 !.vscode/extensions.json
 CMakeListsPrivate.txt
 scripts/__pycache__/
+
+# Left behind by a custom_sdkconfig build, which the pioarduino platform drives
+# through CMake and the ESP-IDF build system. Regenerated, never edited by hand,
+# and not part of this project -- see the note in platformio.ini about why that
+# route is not used here.
+CMakeLists.txt
+sdkconfig.defaults
+sdkconfig.*
+.dummy/

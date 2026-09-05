@@ -111,6 +111,10 @@ NVS_HOME = {
     "adminPass": ("sec", "adminPassword"),
     "deviceName": ("s", "deviceName"),
     "apAlways": ("s", "apAlways"),
+    # The NVS key is short because NVS keys are capped at 15 characters;
+    # the backup key is the readable one. That is exactly what this table
+    # is for.
+    "dlnaOn": ("s", "dlnaEnabled"),
     "ghRepo": ("s", "githubRepo"),
     "ghAsset": ("s", "githubAsset"),
     "ghToken": ("sec", "githubToken"),

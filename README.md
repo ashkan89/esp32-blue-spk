@@ -42,9 +42,15 @@ Classic — and therefore A2DP — does **not** exist on the ESP32-S3, S2, C3 or
 those chips are BLE-only and physically cannot run this sketch, regardless of
 what the folder is named.
 
+There are **two supported boards**, built as two PlatformIO environments
+from one codebase. See [Two build targets](#two-build-targets) for what
+differs between them — including the one signal that has to be wired
+differently on the WROVER.
+
 | Part | Notes |
 |------|-------|
-| ESP32-WROOM-32D devkit, 16 MB flash | classic ESP32 only; this build uses the full 16 MB layout |
+| ESP32-WROOM-32D devkit, 16 MB flash | `esp32_wroom_32d_16mb`. The original target. The 16 MB is verified against the chip at boot, not taken from the module's name |
+| *or* ESP32-WROVER-E-N16R8 | `esp32_wrover_e_n16r8`. Same classic ESP32 die, plus 8 MB of PSRAM — of which a little under 4 MiB is usable as ordinary memory. **GPIO16/17 are committed to its PSRAM, so the DFPlayer's UART moves** |
 | PCM5102A I2S DAC board | the usual purple breakout with a 3.5 mm jack |
 | 0.91" 128×32 I2C OLED  | SSD1306, 4 pins (VCC/GND/SDA/SCL) — optional |
 | DS3231 RTC module      | shares the OLED's two I2C wires; enabled by default |
@@ -63,14 +69,20 @@ The full map, in one table. Each entry is overridable from `build_flags`, and
 [src/pin_check.h](src/pin_check.h) asserts the whole set at compile time — a
 clash or an impossible pin is a build error, not a silent misbehaviour.
 
+This is the **WROOM-32D** map. On a WROVER-E, GPIO16 and GPIO17 belong to the
+PSRAM chip and the DFPlayer's UART moves to **GPIO13 (TX)** and **GPIO19 (RX)**
+— a rewire, not a setting. Everything else is identical. See
+[Two build targets](#two-build-targets); a WROVER build that still points at
+16/17 will not compile.
+
 | GPIO | Used for | Override | Notes |
 |------|----------|----------|-------|
 | 0  | BOOT button: screens, brightness, mode, factory reset, standby wake | `PIN_UI_BUTTON` | **Strapping pin.** Held low at any reset → ROM download mode. The firmware waits for release before every restart it controls |
 | 2  | Status LED (on-board) | `PIN_STATUS_LED`, `STATUS_LED_ACTIVE_HIGH` | **Strapping pin.** Must be low or floating at reset; an LED to ground is |
 | 4  | DFPlayer activity LED | `PIN_DF_LED` (`-1` = none) | ordinary output |
 | 14 | DFPlayer ADKEY1 | `PIN_DF_ADKEY1` | driven open-drain; JTAG MTMS otherwise |
-| 16 | DFPlayer TX → ESP32 RX (UART2) | `PIN_DF_RX` | |
-| 17 | ESP32 TX → DFPlayer RX (UART2), **1 k series** | `PIN_DF_TX` | the resistor is not optional in practice |
+| 16 | DFPlayer TX → ESP32 RX (UART2) | `PIN_DF_RX` | **WROVER-E: PSRAM chip select.** Moves to GPIO19 there |
+| 17 | ESP32 TX → DFPlayer RX (UART2), **1 k series** | `PIN_DF_TX` | the resistor is not optional in practice. **WROVER-E: PSRAM clock.** Moves to GPIO13 there |
 | 18 | WS2812 ring DIN, **330 R series** | `PIN_LEDS` (`-1` = none) | RMT, not bit-banged |
 | 21 | I2C SDA — OLED (0x3C) and DS3231 (0x68) | `PIN_OLED_SDA` | one bus, two devices |
 | 22 | I2C SCL — same two devices | `PIN_OLED_SCL` | |
@@ -85,8 +97,10 @@ clash or an impossible pin is a build error, not a silent misbehaviour.
 | 36 | TP4056 CHRG, if wired | `PIN_BATTERY_CHARGING` (default `-1`) | **Input only** — needs its own 10 k to 3V3 |
 | 39 | TP4056 STDBY, if wired | `PIN_BATTERY_FULL` (default `-1`) | **Input only** — needs its own 10 k to 3V3 |
 
-Free on this build: 5, 12, 13, 15, 19. GPIO1/3 are UART0 (the console and the
-programming port) and GPIO6–11 are the module's own SPI flash.
+Free on a WROOM build: 5, 12, 13, 15, 19. Free on a WROVER build: 5, 12, 15, 36,
+39 — 13 and 19 are spent on the relocated DFPlayer UART, and 16/17 are the
+module's PSRAM. GPIO1/3 are UART0 (the console and the programming port) and
+GPIO6–11 are the module's own SPI flash on both.
 
 #### The three rules a rewire has to respect
 
@@ -408,32 +422,468 @@ This is Espressif's own recommended setup for ESP-IDF on Windows, not a
 workaround specific to this project. Either way, the **first build downloads and
 unpacks several GB** and takes roughly 25 minutes; later builds are ~20 seconds.
 
+## Two build targets
+
+There are two boards now, one codebase, and one firmware version. What differs
+between them is decided in [src/board_caps.h](src/board_caps.h) and enforced in
+the backend — not in the dashboard, which only decides what to *draw*.
+
+| Environment | Module | Flash | PSRAM | Internet radio | DLNA | BLE control |
+|---|---|---|---|---|---|---|
+| `esp32_wroom_32d_16mb` | ESP32-WROOM-32D | 16 MB (verified at boot) | none | no (opt-in flag) | no (opt-in flag) | no |
+| `esp32_wrover_e_n16r8` | ESP32-WROVER-E-N16R8 | 16 MB (verified at boot) | 8 MB fitted, ~4 MiB usable | yes | yes | staged |
+
+Both are **classic ESP32** — Bluetooth 4.2 BR/EDR, Xtensa LX6, one shared 2.4 GHz
+front end. Neither is an S3, S2 or C3, and A2DP does not exist on those parts at
+all, which is why this project has never targeted them.
+
+```sh
+pio run -e esp32_wroom_32d_16mb -t upload     # the WROOM
+pio run -e esp32_wrover_e_n16r8 -t upload     # the WROVER
+```
+
+`esp32dev` still works and is identical to `esp32_wroom_32d_16mb`; so does
+`release`, which is `esp32_wroom_32d_16mb_release`. Nothing that used to be a
+valid build command has stopped being one.
+
+### The one thing that is wired differently
+
+An ESP32-WROVER-E commits **GPIO16 and GPIO17** to its PSRAM chip — 16 is the
+chip select, 17 the clock. This firmware used exactly that pair for the
+DFPlayer's UART, so on the WROVER the module moves:
+
+| Signal | WROOM-32D | WROVER-E | Why |
+|---|---|---|---|
+| DFPlayer TX (ESP32 → module RX, via 1k) | GPIO17 | **GPIO13** | 17 is the PSRAM clock |
+| DFPlayer RX (ESP32 ← module TX) | GPIO16 | **GPIO19** | 16 is the PSRAM chip select |
+| everything else | unchanged | unchanged | |
+
+**This is a rewire, not a setting.** The firmware cannot move a solder joint. If
+you flash the WROVER build onto a board wired the WROOM way, the module will not
+answer.
+
+GPIO13 and GPIO19 were chosen by elimination, and the reasoning is in
+[src/hw_config.h](src/hw_config.h). The short version: GPIO12 is the flash
+voltage strapping pin and the DFPlayer's TX line idles HIGH, so wiring it there
+can stop the board booting at all — intermittently, with no serial log to read,
+because the chip never gets far enough to open one. It is the worst available
+choice and the one that looks most natural on a pinout diagram. GPIO5 and GPIO15
+are also strapping pins and are kept free; GPIO36/39 are input-only; GPIO37/38
+are not bonded out on these modules.
+
+Free and unclaimed on the WROVER after this: GPIO5, GPIO12, GPIO15, GPIO36,
+GPIO39.
+
+A WROVER build that still points at 16/17 is a **compile error**, not a runtime
+surprise:
+
+```
+error: static assertion failed: The DFPlayer TX line is on GPIO16 or GPIO17.
+An ESP32-WROVER-E commits both to its PSRAM chip -- 16 is the chip select,
+17 the clock -- and driving either does not share the pin, it breaks external
+RAM. Move it (hw_config.h has the free pins for this board) or build the
+esp32_wroom_32d_16mb target instead.
+```
+
+Every other pin in the map carries the same assertion, so a future rewire is
+checked too.
+
+### Operating modes
+
+The radio profile (which radio owns the antenna) is a separate question from the
+audio source (where the sound comes from). BLE, where it exists, is a control
+channel and never an audio decoder.
+
+| Target / profile | Wi-Fi + dashboard | Classic A2DP | DFPlayer | Internet radio | UPnP/DLNA | BLE control |
+|---|---|---|---|---|---|---|
+| WROOM: Wi-Fi + DFPlayer | on | off | SD / USB / PC card-reader | **not supported** | no | no |
+| WROOM: Bluetooth audio | **completely off** | on | stopped | no | no | no |
+| WROVER: Wi-Fi only | on | off | — | yes | **yes** (off by default) | staged |
+| WROVER: Wi-Fi + DFPlayer | on | off | SD / USB / PC card-reader | yes | **yes** (off by default) | staged |
+| WROVER: Bluetooth audio | **completely off** | on | stopped | off | off | off |
+
+The renderer runs in **both** Wi-Fi profiles, not just the Wi-Fi-only one:
+a speaker on the network with a decoder can accept a pushed track, and in
+the DFPlayer profile doing so stops the card and takes over. See
+[the renderer section](#play-from-a-phone-or-nas-the-upnpdlna-renderer).
+It is off until switched on, because UPnP has no authentication.
+
+In Bluetooth audio mode on both targets, Wi-Fi station and AP, HTTP, mDNS,
+MQTT and NTP are never started — not stopped, never started — and nothing
+restarts them until the profile is left. The clock, the OLED, the LEDs, the
+alarms and the local buttons all keep working. This separation is deliberate and
+is not a memory workaround: the ESP32 supports Wi-Fi/Bluetooth coexistence in
+principle, and this project gives the antenna to one job at a time for
+predictable audio. **PSRAM does not change this.**
+
+The WROOM's third profile — Wi-Fi with no audio source — still exists, because
+it is where the boot-failure fallback lands and the dashboard has to be able to
+say so. It is reported by `/api/capabilities` with `"audio": false` rather than
+offered as a way to listen to something.
+
+### Internet radio is a WROVER feature
+
+On the WROOM it is **not in the image**. Not hidden, not disabled — absent:
+
+```
+$ xtensa-esp-elf-nm firmware.elf | grep -c net_radio      # WROOM
+0
+$ xtensa-esp-elf-nm firmware.elf | grep -ci helix         # WROOM
+0
+```
+
+`net_radio.cpp` compiles to nothing, the MP3 and AAC decoders go with it, and
+there is no endpoint, MQTT topic, alarm target or restored backup that can reach
+a radio that does not exist. That is worth about 170 KB of flash and 2.4 KB of
+static RAM on that target.
+
+To get the behaviour this firmware shipped with back — internet radio on the
+WROOM, exactly as it was — uncomment one line in `platformio.ini`:
+
+```ini
+[env:esp32_wroom_32d_16mb]
+build_flags =
+    ${env.build_flags}
+    ${wroom.build_flags}
+    -DWROOM_ALLOW_RADIO=1
+```
+
+Nothing was deleted. It fits — it is what runs today — but it fits with nothing
+to spare, and the note in `net_radio.cpp` about heap and TLS is worth reading
+before relying on it alongside the dashboard and an https station.
+
+### Capabilities are enforced, not just hidden
+
+`GET /api/capabilities` (unauthenticated; it names hardware and features, not
+networks or credentials) describes the target, the silicon revision, flash,
+PSRAM, every capability with a **reason** when it is off, the radio profiles,
+what hardware this boot actually found, and the exact supported codec matrix.
+
+The dashboard renders itself from that. But every restriction is *also* checked
+in the handler that would act on it, because a stored preset, a restored backup,
+an MQTT message and a scheduled alarm can all ask for something no button
+offered:
+
+- `POST /api/radio` refuses with 409 and the board's own reason before it reads
+  the action.
+- Restoring a WROVER backup onto a WROOM drops the station list, counts it, and
+  says so in the reply rather than failing silently or writing stations behind a
+  feature that is not there.
+- An alarm set to a radio station in that backup is **retargeted to the chime**
+  and reported — an alarm that does not go off is the worst failure this
+  firmware has, and the owner's intent to be woken survives the change of
+  hardware even though their choice of sound does not.
+- `POST /api/alarms` **refuses** the same thing, because there somebody is
+  looking at the form and can pick another source. Saving something they did not
+  choose would be worse.
+
+### What the boot log tells you
+
+`board_caps_begin()` runs before anything allocates and reports what it found:
+
+```
+[board] target esp32_wrover_e_n16r8 (ESP32-WROVER-E-N16R8)
+[board] silicon: ESP32-D0WD-V3 revision 3.0
+[board] flash: 16 MB physical, 16 MB configured
+[board] psram: 8 MB physical, 4032 KB mapped into the heap, 4032 KB largest block
+[board] psram: the 4 MB above the mapped window needs the banked himem API and
+        is not ordinary malloc memory. Nothing here budgets it as such.
+[board] internal heap at probe: ...
+[board] compiled features: radio yes | dlna no | ble-control no
+```
+
+Two things it deliberately does not do. It does not trust the module's name for
+the flash size — `esp_flash_get_physical_size()` asks the chip, because a 4 MB
+part in a WROOM-32D package boots perfectly and then destroys the filesystem the
+first time anything writes past 4 MB. And it does not report physical PSRAM as
+if it were usable memory: a classic ESP32 reaches external RAM through a 4 MiB
+window, so of the 8 MB fitted, a little under 4 MiB is ordinary `malloc()`
+memory and the rest needs the banked himem API. Both numbers are reported, and
+nothing budgets the second one.
+
+If the build expected hardware it did not find, the board marks itself
+**degraded**: the capabilities that needed the missing part switch off, the
+reason appears in the boot log, in `diag`, and at the top of
+`/api/capabilities`, and the firmware carries on with everything that still
+works. A speaker that will not boot cannot tell anybody why it will not boot.
+
+### The IRAM problem, and what was done about it
+
+Worth knowing before adding anything to this firmware, and worth reading in full
+before changing the reclamation — the first attempt at it boot-looped both
+boards.
+
+`iram0_0_seg` on a classic ESP32 is 128 KB and cannot be traded for any other
+memory. This project linked with **684 bytes of it left** — not a margin, a
+coincidence, and it had already bitten once (platformio.ini records the WS2812
+driver overflowing the segment by 216 bytes).
+
+Adding the WROVER target broke it. External RAM needs its low-level quad-SPI
+driver resident in IRAM — 4,215 bytes, because it runs while the cache is being
+reconfigured — and the build overflowed by 3,844 bytes.
+
+#### Where the room is
+
+The precompiled framework libraries are built with
+`CONFIG_SPIRAM_CACHE_WORKAROUND=y`, for a PSRAM cache erratum on ESP32 revisions
+below 3. One of the things that option does is place the whole of newlib in
+IRAM. Two artefacts show up in a build: `esp32.rom.libc-funcs.ld` is not linked,
+and `sections.ld` carries ~125 lines placing whole `libc.a` members in IRAM.
+
+#### The mistake, because it is the important part
+
+The first version moved **all** of that to flash, on the reasoning that nothing
+in ESP-IDF calls libc with the cache disabled. That reasoning was wrong. Both
+boards panicked before `app_main`, in a boot loop, recoverable only over USB:
+
+```
+Guru Meditation Error: Core 0 panic'ed (Cache error).
+Cache disabled but cached memory region accessed
+PC : 0x4026b0ac
+memset  <- read_id_core (spi_flash/esp_flash_api.c:487)
+        <- esp_flash_read_chip_id <- esp_flash_init_default_chip
+```
+
+`read_id_core` reads the flash chip's JEDEC id, which by definition runs with
+the flash cache **disabled** — and it calls `memset`. With `memset` in flash,
+the fetch to execute it is a cached read that cannot be serviced.
+
+So the memory and string primitives are in IRAM for **flash-safety**, not only
+for the PSRAM erratum, and `sections.ld` does not distinguish the two reasons.
+Anything that moves libc has to.
+
+#### What it does now
+
+[scripts/iram_reclaim.py](scripts/iram_reclaim.py) does two things:
+
+1. **Links the ROM copies** of the libc functions the chip has in ROM. Always
+   safe and unconditional: ROM is at `0x40000000` and is executable regardless
+   of cache state, so a flash-driver call into ROM libc works with the cache
+   off. It is also what the pioarduino platform does by itself for a non-PSRAM
+   board. Worth about 2 KB.
+
+2. **Moves only newlib's calendar code** out of IRAM, by explicit name —
+   `mktime`, `tzset`, `strptime`, `gmtime_r`, `strftime` and the rest. Date
+   arithmetic is not reachable from a cache-disabled path, and it is where the
+   bulk of the waste was: `strptime_l` (1,589 B), `_tzset_unlocked_r` (1,118),
+   `mktime` (892), `localtime_r` (584), `gmtime_r` (446) and `__tzcalc_limits`
+   (402).
+
+An allowlist is a judgement, and this file has been wrong about a judgement
+once, so it is **checked mechanically as well**. Before moving a member, the
+build reads the undefined symbols of every archive `sections.ld` places in IRAM
+— exactly the code that may run with the cache off — and refuses to move any
+libc member that defines one of them. It is conservative in the safe direction:
+it may keep something in IRAM that did not need to be there, which costs bytes
+rather than boots. Had `memset` been on the allowlist, this would have caught
+it; in practice it catches `localtime_r`, which `liblog` references:
+
+```
+iram_reclaim: linking newlib from ROM (esp32.rom.libc-funcs.ld)
+iram_reclaim: keeping libc_a-lcltime_r in IRAM -- cache-disabled code references localtime_r
+iram_reclaim: moved 19 newlib calendar member(s) out of IRAM, kept 1 back
+```
+
+Anything it cannot determine — no `nm`, no `libc.a`, an unfamiliar
+`sections.ld` — means nothing moves and the link is the stock one. Failing back
+to a build that boots is the only acceptable failure here.
+
+| | IRAM used | free |
+|---|---|---|
+| before, WROOM (no PSRAM support at all) | 130,388 | 684 |
+| after, WROOM | 124,939 | **6,133** |
+| after, WROVER, **with** PSRAM support and the renderer | 129,619 | **1,453** |
+
+The WROVER's 1,453 bytes are tight. That is the real budget on that target with
+external RAM enabled, and anything added to IRAM there will have to come from
+somewhere.
+
+#### Checking it
+
+```sh
+python scripts/test_iram_safety.py
+```
+
+reads the linked ELF of every environment under `.pio/build` and asserts that
+every memory and string primitive is in ROM or IRAM, and that the calendar
+functions did move. **Run it after a build and before flashing** — it is the
+difference between finding this at a terminal and finding it with a cable.
+
+```
+ok    esp32_wroom_32d_16mb           IRAM 124939 used,  6133 free
+ok    esp32_wrover_e_n16r8           IRAM 129619 used,  1453 free
+```
+
+A broader version of that check was tried and removed: requiring that *no*
+symbol referenced by an IRAM-placed archive is in flash. It reports about 220
+symbols on a known-good stock build, because those archives hold flash-resident
+code as well, and an archive's undefined symbols are the union of what both
+halves call. A check that fails on a good build is not a check.
+
+#### Switches
+
+```ini
+build_flags = -DIRAM_RECLAIM=0   ; stock link, nothing reclaimed
+build_flags = -DIRAM_RECLAIM=1   ; ROM redirect only, sections.ld untouched
+```
+
+With either, the WROVER fails to link with a plain IRAM overflow — an honest
+outcome rather than a silent one.
+
+The tidier fix would be rebuilding the framework libraries with
+`CONFIG_SPIRAM_CACHE_WORKAROUND=n`, which removes the placements at the source.
+It was tried and does not work on this machine: the pioarduino platform drives
+that through CMake and the ESP-IDF build system, neither of which is installed.
+platformio.ini records the attempt.
+
+### What is done, and what is not
+
+The dual-target work was done as one slice: build system, capability model, and
+the enforcement that makes the mode matrix real. Everything below is stated at
+the level it has actually been verified, because "it compiles" and "it works"
+are different claims and a feature list that blurs them is worse than no list.
+
+**Implemented and build-verified** — compiles clean on all seven environments,
+zero warnings, and checked against the linked ELF where the claim is about the
+binary:
+
+- Two primary environments with project-local board manifests, per-target pin
+  maps, and a pinned partition table.
+- The capability model: compile-time gates, a boot-time probe of flash, PSRAM
+  and silicon revision, and `board_can()` / `board_why_not()` as the single
+  place either question is answered.
+- Internet radio compiled out of the WROOM (verified: zero `net_radio` and zero
+  decoder symbols in that ELF) and enforced in the backend on every path that
+  could ask for it — the API, a restored backup, an alarm, MQTT, the console.
+- `GET /api/capabilities`, and a dashboard that renders its navigation from it.
+- The UPnP/DLNA renderer: SSDP discovery, device and service descriptions,
+  AVTransport / RenderingControl / ConnectionManager, GENA eventing, and a
+  truthful `GetProtocolInfo`. Compiled only where the decoder is (verified:
+  zero UPnP protocol strings in the WROOM image), off until switched on.
+- Internet radio's jitter buffer sized from the board rather than a constant
+  — 20 kB on the WROOM as before, up to 256 kB in PSRAM on the WROVER — and
+  the admission check no longer reads internal-only heap and calls a board
+  with 8 MB of PSRAM "low on memory".
+- The IRAM reclamation, without which the WROVER target does not link.
+- `diag` reporting the target, the compiled feature set, and physical versus
+  mapped PSRAM.
+- Host-side tests: 21 pin-map cases, the partition layout, IRAM safety, the
+  settings backup format, Persian shaping — all passing.
+
+**What hardware testing has already found.** The first flash of this work
+boot-looped both boards with a cache-error panic before `app_main` — the IRAM
+reclamation had moved `memset` out of IRAM, and the flash driver calls it with
+the cache disabled. That is fixed, the reclamation is now narrow and
+mechanically guarded, and `scripts/test_iram_safety.py` exists so it cannot
+recur silently. The full account is in
+[The IRAM problem](#the-iram-problem-and-what-was-done-about-it), because the
+mistake is more instructive than the fix.
+
+The lesson generalises: **run `python scripts/test_iram_safety.py` after
+building and before flashing.** The failure class it catches is not a
+misbehaviour, it is a board that needs a USB cable to recover.
+
+**Still not verified on hardware.** Beyond "it boots", nothing in this slice has
+been exercised on a board. The WROVER path in particular: the boot-time probe,
+the degraded path when PSRAM is missing, and the moved DFPlayer UART are all
+build-verified only. The first three things worth checking against real
+silicon:
+
+1. that the chip reports revision 3.x — the decision to build without the PSRAM
+   cache workaround rests on it, and the firmware marks itself degraded and
+   refuses to use external RAM if it is not;
+2. the `[board] psram:` line — physical versus mapped, which should read about
+   8 MB fitted and a little under 4 MiB usable;
+3. that the DFPlayer answers on GPIO13/19, **after rewiring it**. That is a
+   soldering job, not a setting.
+
+The existing WROOM behaviour is unchanged by this work except for internet
+radio, which is now opt-in on that target. It has not been re-run on hardware
+either, so treat the first flash as a regression test rather than an upgrade.
+
+**Not implemented.** These are named because the capability model reports them
+as unavailable with a reason rather than pretending, and because a plan is not
+a feature:
+
+| | Where it stands |
+|---|---|
+| BLE control / provisioning | `CAP_BLE_CTRL` is 0 on both targets. Nothing is written. |
+| Profile/source separation on the WROVER | The profile and the selected source are reported separately by `/api/capabilities`, but switching source within the network profile still means switching radio profile, which still reboots. Merging the two Wi-Fi profiles into one with a live source selector is the next structural step. |
+| Podcasts, playlists, bookmarks, queue persistence | Not started. The `spiffs` partition is where they belong; see [16 MB flash layout](#16-mb-flash-layout). |
+| ReplayGain, audiobook speed, timeshift buffer | Not started, and all three want a resource budget measured on the WROVER first. |
+
+### Partitions
+
+Both targets use [partitions/esp32_16mb_ota.csv](partitions/esp32_16mb_ota.csv),
+which is **byte-for-byte the framework's `default_16MB.csv`**. It is pinned in
+the repository rather than referenced by name so that a platform update cannot
+move the NVS offset under a fleet of flashed devices — that is the one build
+input where a change is unrecoverable.
+
+Because the geometry is unchanged, **there is no migration**. A device running
+the previous firmware takes this build over OTA and keeps its settings, Wi-Fi
+credentials, stations, alarms and Bluetooth bonds.
+
+```sh
+python scripts/test_partitions.py
+```
+
+checks tiling, 64 KB app alignment, OTA slot symmetry, that the built images fit
+inside a 75% budget, and that `nvs` has not moved from `0x9000` or shrunk.
+
+New bulk records — queues, media catalogs, feed subscriptions, bookmarks, the
+event log — belong in the **spiffs** partition (3.375 MB, currently unused), not
+in NVS. NVS is a 20 KB key/value store with a rewrite cost per commit; a growing
+queue is neither small nor rarely written.
+
 ## Build & flash
 
 ```sh
-pio run                        # compile
-pio run -e esp32dev -t upload  # flash the speaker firmware
-pio device monitor             # serial log at 115200
+pio run                                          # compile the WROOM (the default)
+pio run -e esp32_wroom_32d_16mb -t upload        # flash a WROOM-32D
+pio run -e esp32_wrover_e_n16r8 -t upload        # flash a WROVER-E-N16R8
+pio device monitor                               # serial log at 115200
 
-pio run -t clean               # throw the build away and start again
+pio run -t clean                        # throw the build away and start again
 pio check -e esp32dev --skip-packages   # cppcheck over src/ only
 python scripts/test_pin_check.py        # the pin map, checked on the host
+python scripts/test_partitions.py       # the 16 MB layout and the image fit
+python scripts/test_iram_safety.py      # nothing cache-disabled code needs is in flash
 python scripts/test_settings_backup.py  # the settings backup format, ditto
 python scripts/test_arabic_shaping.py   # Persian shaping and bidi
 python scripts/gen_arabic_tables.py     # ...and its tables, vs Unicode
 ```
 
-There is one environment, `esp32dev`, so `pio run` and `pio run -e esp32dev` are
-the same thing.
+`pio run` with no `-e` builds `esp32_wroom_32d_16mb`, which is the board this
+project started on. `esp32dev` is kept as an alias for it, and `release` as an
+alias for `esp32_wroom_32d_16mb_release`, so no build command that used to work
+has stopped working.
 
 Then on your phone: Bluetooth settings → pair with **"esp32-blue-spk"** → play.
 
 ### What a clean build should say
 
 ```
-RAM:   [===       ]  28.3% (used 92884 bytes from 327680 bytes)
-Flash: [====      ]  39.2% (used 2571268 bytes from 6553600 bytes)
+$ pio run -e esp32_wroom_32d_16mb
+iram_reclaim: linking newlib from ROM (esp32.rom.libc-funcs.ld)
+iram_reclaim: keeping libc_a-lcltime_r in IRAM -- cache-disabled code references localtime_r
+iram_reclaim: moved 19 newlib calendar member(s) out of IRAM, kept 1 back
+RAM:   [===       ]  26.5% (used 86996 bytes from 327680 bytes)
+Flash: [====      ]  41.0% (used 2688652 bytes from 6553600 bytes)
+
+$ pio run -e esp32_wrover_e_n16r8
+RAM:   [===       ]  28.3% (used 92572 bytes from 327680 bytes)
+Flash: [====      ]  44.5% (used 2917408 bytes from 6553600 bytes)
 ```
+
+All seven environments — the two targets, their four release variants and the
+`release-verbose` diagnostic build — compile with **zero warnings**. If one
+appears, it is new.
+
+The WROOM figures are smaller than the WROVER's because internet radio and its
+two decoders are not compiled into that target at all — see
+[Two build targets](#two-build-targets). The two `iram_reclaim` lines are
+expected on both and are explained in the same section.
 
 The flash denominator is the 6.25 MB `app0` slot of the 16 MB partition table,
 not the chip — see [16 MB flash layout](#16-mb-flash-layout). The RAM figure is
@@ -441,7 +891,6 @@ what the linker places statically; the heap is what is left of the 320 KB after
 that, and the radios take most of it at run time. `diag` reports the live
 numbers.
 
-A clean build produces **no compiler warnings**. If one appears, it is new.
 
 ### Checking the pin map
 
@@ -470,14 +919,23 @@ all 21 pin-map cases behaved as specified
 
 ## Development and release builds
 
-Two environments, and the difference is what the firmware is willing to say.
+Each target has a development build and a release build, and the difference is
+what the firmware is willing to say.
 
 ```
-pio run -e esp32dev -t upload      # development: logs, console, diag
-pio run -e release  -t upload      # release: none of the above
+pio run -e esp32_wroom_32d_16mb          -t upload   # development: logs, console, diag
+pio run -e esp32_wroom_32d_16mb_release  -t upload   # release: none of the above
+
+pio run -e esp32_wrover_e_n16r8          -t upload   # the same pair for the WROVER
+pio run -e esp32_wrover_e_n16r8_release  -t upload
 ```
 
-**`esp32dev`** is what you flash while you are working on the thing. It narrates
+`esp32dev` and `release` are aliases for the first two, kept because they have
+been the build commands for months. The table below compares those two; the
+WROVER pair differs the same way.
+
+**The development build** is what you flash while you are working on the thing.
+It narrates
 the boot, names every state change on the UART, offers a console that can drive
 every subsystem by hand, and prints the full `diag` report.
 
@@ -491,16 +949,16 @@ every subsystem by hand, and prints the full `diag` report.
 | IDF logging | `CORE_DEBUG_LEVEL=1` | `CORE_DEBUG_LEVEL=0` |
 | `assert()` | active | `NDEBUG` |
 | Flash clock | 40 MHz DIO | **80 MHz** DIO |
-| Firmware image | 2,895,728 B | **2,805,392 B** |
+| Firmware image | 2,688,652 B | **2,601,056 B** |
 
 You can check the last claim rather than believing it:
 
 ```
-grep -ac "screen 0..7" .pio/build/esp32dev/firmware.bin    # 1
-grep -ac "screen 0..7" .pio/build/release/firmware.bin     # 0
+grep -ac "screen 0..7" .pio/build/esp32_wroom_32d_16mb/firmware.bin          # 1
+grep -ac "screen 0..7" .pio/build/esp32_wroom_32d_16mb_release/firmware.bin  # 0
 ```
 
-The saving is 90 kB of flash and 152 bytes of RAM, which is the honest shape of
+The saving is 88 kB of flash and 128 bytes of RAM, which is the honest shape of
 it: the log was never a RAM cost. The reasons to build release are that a
 production unit should not narrate itself to anybody holding a UART adapter, and
 that **the console is an unauthenticated control channel** — mode switches, the
@@ -557,9 +1015,9 @@ and only one of them is the obvious one. All three are in
 [platformio.ini](platformio.ini):
 
 ```ini
-board_upload.flash_size = 16MB          ; the bootloader image header
-board_build.partitions  = default_16MB.csv  ; the table itself
-board                   = esp32dev      ; whose own JSON still says 4 MB
+board_upload.flash_size = 16MB                            ; the image header
+board_build.partitions  = partitions/esp32_16mb_ota.csv   ; the table itself
+board                   = esp32_wroom_32d_16mb            ; boards/*.json, ours
 ```
 
 `board_upload.flash_size` is what writes the size nibble into the image header,
@@ -569,12 +1027,26 @@ that runs off the end of what the bootloader thinks the chip is. Setting only
 the first gives 16 MB of flash with a 4 MB table on it — a board that boots, runs
 and silently wastes three quarters of its storage.
 
-`esp32dev`'s board definition still declares 4 MB, and that is fine: the two
-overrides above take precedence, and PlatformIO recomputes the "maximum program
-size" from the partition CSV, which is why a build reports **6553600 bytes** and
-not 4194304.
+The board definitions are project-local, in [boards/](boards/), because nothing
+shipped describes either target: the stock `esp32dev` declares 4 MB, and
+`esp-wrover-kit` is the FTDI development kit rather than a bare WROVER-E module.
+Both files carry their reasoning in a `_comment` key. PlatformIO recomputes the
+"maximum program size" from the partition CSV, which is why a build reports
+**6553600 bytes** — the `app0` slot — and not the flash size.
 
-The table is the Arduino core's stock `default_16MB.csv`:
+None of this is trusted at run time. `board_caps_begin()` calls
+`esp_flash_get_physical_size()` and compares it with what the image was
+configured for; a mismatch marks the board degraded and says so everywhere,
+because a 4 MB part in a 16 MB-configured build boots perfectly well and then
+destroys the filesystem the first time anything writes past 4 MB.
+
+The table lives in [partitions/esp32_16mb_ota.csv](partitions/esp32_16mb_ota.csv)
+and is **byte-for-byte the Arduino core's stock `default_16MB.csv`**. It is
+copied into the repository rather than referenced by name so that a platform
+update cannot move the NVS offset under a fleet of already-flashed devices —
+that is the one build input where a change cannot be undone by reflashing.
+Because the geometry is identical, **nothing migrates**: an existing unit takes
+this firmware over OTA and keeps every stored setting.
 
 | Name | Type | Offset | Size | What it is |
 |------|------|--------|------|------------|
@@ -586,9 +1058,39 @@ The table is the Arduino core's stock `default_16MB.csv`:
 | `coredump` | data | `0xFF0000` | 64 KB | a panic dump, for `esp-coredump` |
 
 `0xFF0000 + 0x10000 = 0x1000000` exactly — the table fills the chip with nothing
-overlapping and nothing past the end. The application is currently about
-2.6 MB, so slot A is ~39 % used and there is room for the OTA to write a much
-larger image into slot B.
+overlapping and nothing past the end. The application is currently about 2.7 MB
+on the WROOM and 2.9 MB on the WROVER, so slot A is a little over 40 % used and
+there is room for the OTA to write a much larger image into slot B. Roughly
+2.3 MB of that is `src/voice_clips.h`, the pre-rendered speech, so the code
+itself is about half a megabyte — worth knowing before reading the headroom as
+room for features, because adding phrases costs far more than adding code.
+
+All of the above is asserted by a script rather than by this table being read
+carefully:
+
+```sh
+$ python scripts/test_partitions.py
+...
+image  esp32_wroom_32d_16mb         2723616 bytes   41.6% of slot  ok
+image  esp32_wrover_e_n16r8         2962768 bytes   45.2% of slot  ok
+All partition checks passed.
+```
+
+It checks tiling and overlap, 64 KB alignment on the app partitions (the flash
+MMU maps instruction memory in 64 KB pages, so a misaligned app partition does
+not fail to flash — it fails to boot), that the two OTA slots are the same size,
+that the built images fit inside a 75 % budget, and that `nvs` has not moved from
+`0x9000` or shrunk.
+
+### Where new records go
+
+`spiffs` is 3.375 MB and, as of this build, still unused. That is where growing
+records belong — queues, media catalogs, feed subscriptions, bookmarks, the
+event log — and **not** NVS. NVS is a 20 KB key/value store with a rewrite cost
+per commit; a growing queue is neither small nor rarely written. Growing NVS
+would have been the other answer, and it was rejected: it moves `otadata`, which
+is where the bootloader looks to decide which slot to boot, and getting that
+wrong turns a unit into one that needs a cable.
 
 **OTA is real here, not nominal.** Two same-sized app slots, an `otadata`
 partition to arbitrate them, and a firmware that writes with `Update.begin()`
@@ -2225,6 +2727,124 @@ station http://…       play any stream address
 station stop|next|prev
 ```
 
+## Play from a phone or NAS: the UPnP/DLNA renderer
+
+The speaker can appear on the network as a **UPnP AV MediaRenderer**. A control
+point — BubbleUPnP, Hi-Fi Cast, VLC, foobar2000, a NAS's own web UI — finds it,
+hands it a URL, and it fetches and plays the media itself.
+
+It runs in **both Wi-Fi profiles**: Wi-Fi only, and Wi-Fi + DFPlayer. There is
+no reason a speaker that is on the network and has a decoder should not accept a
+track, and in the DFPlayer profile a push from a controller simply stops the
+card and takes over — the same one-active-source rule everything else follows.
+
+**It is off by default.** Turn it on under **Radio → Play from a phone or NAS**.
+
+### What it is, and is not
+
+| | |
+|---|---|
+| Renderer | Yes. It plays what a controller sends it. |
+| Media server | No. It never holds or indexes music. |
+| Control point | No. It does not browse other devices. |
+| DLNA certified | No. It speaks the protocols; there is no certification behind that word. |
+| AirPlay / Chromecast / Spotify Connect | No — different, unrelated protocols. A UPnP controller cannot cast arbitrary system audio, only a URL the speaker can reach. |
+
+### Supported media
+
+**MP3 and AAC-LC, over plain `http://`.** That is the whole list, and it is what
+`GetProtocolInfo` advertises rather than the usual wildcard — a controller that
+checks before sending gets a truthful answer instead of a failure afterwards.
+
+The reason is that the renderer has no decoder of its own: it hands the URL to
+the same pipeline internet radio uses, so it plays exactly what the radio plays.
+That is also why it is only compiled where the radio is.
+
+`https://` is refused, deliberately and immediately. There is room on this chip
+for one TLS session and the firmware updater owns it; letting a controller queue
+an https URL would produce a stream that fails a minute later instead of an
+error the controller can show.
+
+Seeking, pause-and-resume, playlists and gapless are not implemented. `Pause`
+behaves as `Stop` and reports `STOPPED`, because a live http read has nothing to
+resume from — reporting `PAUSED_PLAYBACK` and then behaving like a stop is the
+version of this that makes a controller's progress bar lie. Duration is
+reported as `0:00:00`, which is UPnP's "not applicable"; elapsed time is real.
+
+### Security — read this before switching it on
+
+**UPnP has no authentication.** Not "this implementation lacks it" — the
+protocol has none, and every renderer on the market is the same. While the
+renderer is on, anything on your LAN that can reach port 49494 can make this
+speaker play a URL and change its volume.
+
+What follows from that, and is enforced:
+
+- it is **off by default** and is switched on from the dashboard, which *is*
+  authenticated;
+- it can touch playback and volume and **nothing else** — not settings, not
+  Wi-Fi credentials, not the radio profile, not the firmware;
+- URLs are validated before use: `http` only, bounded length, and
+  `http://user:pass@host` is refused, because that is a way to get a password
+  into a log;
+- track titles and controller names are escaped before the dashboard renders
+  them. They come from a device on the network, not from here.
+
+If the network is not trusted, leave it off. The switch is the security control.
+
+### What is implemented
+
+Discovery over SSDP (M-SEARCH responses, periodic `alive`, `byebye` on stop),
+the device and service descriptions, and three services:
+
+| Service | Actions |
+|---|---|
+| AVTransport | `SetAVTransportURI`, `Play`, `Pause`, `Stop`, `GetTransportInfo`, `GetPositionInfo`, `GetMediaInfo`, `GetTransportSettings`, `GetDeviceCapabilities` |
+| RenderingControl | `GetVolume`, `SetVolume`, `GetMute`, `SetMute` |
+| ConnectionManager | `GetProtocolInfo`, `GetCurrentConnectionIDs`, `GetCurrentConnectionInfo` |
+
+Plus GENA eventing — `SUBSCRIBE`, `UNSUBSCRIBE` and `NOTIFY` with a `LastChange`
+payload — which is what makes a controller's play button and volume slider
+follow the speaker when it is changed from the dashboard or the buttons rather
+than from the app.
+
+Actions that are not implemented are **refused by name** with UPnP error 701
+rather than ignored, so a controller stops offering the button.
+
+The service descriptions list only the actions above. Padding them out with
+actions that would return "not implemented" is how a Seek control appears on a
+live stream.
+
+### Why it has its own HTTP server
+
+The dashboard's `WebServer` cannot serve this. UPnP eventing uses `SUBSCRIBE`,
+`UNSUBSCRIBE` and `NOTIFY`, and the Arduino `WebServer` parses the request line
+against a fixed table of methods and drops the connection on anything else
+(`Parsing.cpp`: *"Unknown HTTP Method"*). There is no hook to add one.
+
+So the renderer runs a small HTTP/1.1 server of its own on port **49494**, which
+also keeps unauthenticated UPnP traffic off the authenticated dashboard. It
+costs one listening socket and one UDP socket, both serviced from `loop()` — no
+extra task, no extra stack. Every operation is bounded: a request that does not
+arrive within 3 s is dropped, a body over 4 kB is refused, and at most one
+`NOTIFY` is sent per loop pass so a controller that walked away cannot stall
+anything with a connect timeout.
+
+### Checking it
+
+```
+$ dlna
+[dlna] enabled, discoverable | port 49494 | PLAYING
+[dlna] uri   http://192.168.1.20:8200/MediaItems/418.mp3
+[dlna] title Kind of Blue - So What
+[dlna] last controller: BubbleUPnP/4.4
+[dlna] 2 subscription(s), 37 actions served
+```
+
+`diag` reports the same, and the dashboard card shows it live. From a computer
+on the same network, `http://<speaker-ip>:49494/desc.xml` should return the
+device description.
+
 ## Spoken announcements
 
 The speaker can say things: "battery critically low", "Wi-Fi connected",
@@ -3019,7 +3639,10 @@ group — most of the pass criteria below are one line of that report.
 | [src/status_led.h](src/status_led.h) / [.cpp](src/status_led.cpp) | the on-board LED: one blink pattern per state, plus event blips |
 | [src/df_player.h](src/df_player.h) / [.cpp](src/df_player.cpp) | the DFPlayer Mini: the YX5200 protocol, its GPIOs, and the driver task that owns the UART |
 | [src/battery.h](src/battery.h) / [.cpp](src/battery.cpp) | the battery gauge: median-filtered ADC, the discharge curve, charger pins |
-| [src/hw_config.h](src/hw_config.h) | every DFPlayer and battery pin and tunable, with the wiring in the header comment |
+| [src/board_caps.h](src/board_caps.h) / [.cpp](src/board_caps.cpp) | which of the two boards this is and what it can do: the compile-time feature gates, the boot-time probe of flash, PSRAM and silicon revision, and the one place `board_can()` / `board_why_not()` answer from |
+| [src/hw_config.h](src/hw_config.h) | every DFPlayer and battery pin and tunable, with the wiring in the header comment — and the per-target pin map, because GPIO16/17 are the WROVER's PSRAM |
+| [boards/](boards/) | the two project-local PlatformIO board manifests, each with its reasoning in a `_comment` key |
+| [partitions/esp32_16mb_ota.csv](partitions/esp32_16mb_ota.csv) | the 16 MB layout, pinned in the repository so a platform update cannot move the NVS offset under a flashed device |
 | [src/management.h](src/management.h) / [.cpp](src/management.cpp) | Wi-Fi, authenticated API, Bluetooth/media control, OTA and GitHub updater |
 | [src/web_assets.h](src/web_assets.h) | responsive dashboard source, gzip-embedded at build time; its `<script>` is syntax-checked by [scripts/embed_web.py](scripts/embed_web.py) before every build |
 | [src/ui_config.h](src/ui_config.h) | every display, analyser and clock knob |
@@ -3031,6 +3654,7 @@ group — most of the pass criteria below are one line of that report.
 | [src/power.h](src/power.h) / [.cpp](src/power.cpp) | power saving: the three modes, the battery policy, and the four things it switches off |
 | [src/audio_eq.h](src/audio_eq.h) / [.cpp](src/audio_eq.cpp) | the five-band equaliser: cookbook biquads, the presets, the automatic preamp |
 | [src/net_radio.h](src/net_radio.h) / [.cpp](src/net_radio.cpp) | internet radio: the decoder task, the jitter buffer, ICY metadata, reconnection, the favourites |
+| [src/dlna.h](src/dlna.h) / [.cpp](src/dlna.cpp) | the UPnP/DLNA MediaRenderer: SSDP discovery, its own small HTTP server (the dashboard's cannot serve SUBSCRIBE), the three AV services, GENA eventing. Hands the URL to net_radio rather than decoding anything itself |
 | [src/voice.h](src/voice.h) / [.cpp](src/voice.cpp) | spoken announcements: the ADPCM decoder, the resampler, the ducking mixer, the queue |
 | [src/voice_clips.h](src/voice_clips.h) | the clips themselves — generated, committed, never rebuilt by a build |
 | [src/alarm_clock.h](src/alarm_clock.h) / [.cpp](src/alarm_clock.cpp) | alarms and the sleep timer: scheduling, the wake-up ramp, the fallback to the chime |
@@ -3041,7 +3665,10 @@ group — most of the pass criteria below are one line of that report.
 | [src/pin_check.h](src/pin_check.h) | the whole pin map in one place, asserted at compile time — no code, no flash |
 | [src/app_config.h](src/app_config.h) | the build-time switches — `SERIAL_LOG`, `CONSOLE_ENABLED`, `DIAGNOSTICS_ENABLED` — and the `LOGF`/`LOGLN`/`LOGP` macros every file logs through |
 | [src/diagnostics.h](src/diagnostics.h) / [.cpp](src/diagnostics.cpp) | the `diag` console report: reset reason, heap, task stacks, what was detected, link counters, partitions |
+| [scripts/iram_reclaim.py](scripts/iram_reclaim.py) | build step that takes newlib out of IRAM, where the precompiled framework libraries put it for a silicon erratum neither target has. Without it the WROVER does not link at all |
 | [scripts/test_pin_check.py](scripts/test_pin_check.py) | host-side test that the pin assertions actually assert — 21 cases, no board needed |
+| [scripts/test_partitions.py](scripts/test_partitions.py) | host-side test of the 16 MB layout: overlap, alignment, OTA symmetry, image fit, and that NVS has not moved |
+| [scripts/test_iram_safety.py](scripts/test_iram_safety.py) | reads each linked ELF and asserts that nothing the flash cache is disabled for ended up in flash. Run it before flashing: the failure it catches is a boot loop that needs a cable |
 | [scripts/test_settings_backup.py](scripts/test_settings_backup.py) | host-side test that the settings backup and restore agree, key by key, and cover every stored preference |
 | [src/text_arabic.h](src/text_arabic.h) / [.cpp](src/text_arabic.cpp) | Arabic-script shaping and right-to-left ordering: four contextual shapes per letter, lam-alef ligatures, mixed Latin runs |
 | [scripts/gen_arabic_tables.py](scripts/gen_arabic_tables.py) | derives the shaping tables from Unicode and checks the committed ones still match |

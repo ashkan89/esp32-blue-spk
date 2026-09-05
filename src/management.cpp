@@ -1,4 +1,5 @@
 #include "app_config.h"
+#include "board_caps.h"
 #include "management.h"
 
 #if MANAGEMENT_ENABLED
@@ -13,6 +14,7 @@
 #include <WiFi.h>
 #include <esp_bt.h>
 #include <esp_gap_bt_api.h>
+#include <esp_heap_caps.h>
 #include <esp_ota_ops.h>
 #include <esp_random.h>
 #include <mbedtls/base64.h>
@@ -29,6 +31,7 @@
 #include "audio_probe.h"
 #include "battery.h"
 #include "df_player.h"
+#include "dlna.h"
 #include "home_assistant.h"
 #include "leds.h"
 #include "net_radio.h"
@@ -54,6 +57,18 @@ struct Settings {
   String githubAsset;
   String githubToken;
   bool apAlways;
+
+  /*
+   * The UPnP/DLNA renderer, off unless the owner turned it on.
+   *
+   * Off is the default and it is a security decision rather than a
+   * conservative one: UPnP has no authentication, so anything on the LAN
+   * that can reach the renderer's port can make this speaker play a URL.
+   * Every renderer on the market is like that; the difference here is that
+   * it is not running until somebody who got past the dashboard's password
+   * says so. See the note at the top of src/dlna.h.
+   */
+  bool dlnaEnabled;
 
   // DFPlayer boot defaults. The module forgets everything at power-off, so the
   // firmware has to hand it a source, a volume and an EQ every time; these are
@@ -277,6 +292,7 @@ void loadSettings(const char *fallbackName) {
   settings.githubAsset = prefs.getString("ghAsset", DEFAULT_GITHUB_ASSET);
   settings.githubToken = prefs.getString("ghToken", "");
   settings.apAlways = prefs.getBool("apAlways", false);
+  settings.dlnaEnabled = prefs.getBool("dlnaOn", false);
 
   settings.dfSource = prefs.getUChar("dfSrc", (uint8_t)DF_SRC_SD);
   settings.dfVolume = prefs.getUChar("dfVol", DF_VOLUME_DEFAULT);
@@ -399,6 +415,7 @@ void saveSettings() {
   prefs.putString("ghAsset", settings.githubAsset);
   prefs.putString("ghToken", settings.githubToken);
   prefs.putBool("apAlways", settings.apAlways);
+  prefs.putBool("dlnaOn", settings.dlnaEnabled);
 
   prefs.putUChar("dfSrc", settings.dfSource);
   prefs.putUChar("dfVol", settings.dfVolume);
@@ -1336,9 +1353,29 @@ void handleStatus() {
   system["chip"] = ESP.getChipModel();
   system["cores"] = ESP.getChipCores();
   system["cpuMHz"] = ESP.getCpuFreqMHz();
+  /*
+   * Internal heap, named as such.
+   *
+   * ESP.getFreeHeap() is heap_caps_get_free_size(MALLOC_CAP_INTERNAL) -- it has
+   * never counted external RAM. That was fine while no board had any. On a
+   * WROVER, showing this number alone under a heading that says "memory" is how
+   * a dashboard tells somebody with 8 MB fitted that they are low on it.
+   *
+   * The old keys keep their names and their meaning so a cached page still
+   * works; the PSRAM figures sit alongside, and the dashboard shows both.
+   */
   system["heapFree"] = ESP.getFreeHeap();
   system["heapMin"] = ESP.getMinFreeHeap();
   system["heapMaxBlock"] = ESP.getMaxAllocHeap();
+  const BoardCaps &bc = board_caps();
+  JsonObject psram = system["psram"].to<JsonObject>();
+  psram["present"] = bc.psram_ok;
+  if (bc.psram_ok) {
+    psram["physical"] = bc.psram_physical_bytes;
+    psram["mapped"] = bc.psram_mapped_bytes;
+    psram["free"] = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    psram["maxBlock"] = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
+  }
   system["flashBytes"] = ESP.getFlashChipSize();
   system["uptimeMs"] = millis();
   system["resetReason"] = (int)esp_reset_reason();
@@ -2192,6 +2229,8 @@ void handleSettingsGet() {
   doc["deviceName"] = settings.deviceName;
   doc["savedSsid"] = settings.ssid;
   doc["apAlways"] = settings.apAlways;
+  doc["dlnaEnabled"] = settings.dlnaEnabled;
+  doc["dlnaSupported"] = board_can(BOARD_CAP_DLNA);
   doc["apPasswordSet"] = settings.apPassword.length() >= 8;
   doc["defaultAdminPassword"] = settings.adminPassword == "admin";
   doc["githubRepo"] = settings.githubRepo;
@@ -2310,6 +2349,21 @@ void handleSettingsSave() {
   if (!body["hostname"].isNull()) settings.hostname = cleanHostname(body["hostname"].as<String>());
   if (!body["deviceName"].isNull()) settings.deviceName = cleanDeviceName(body["deviceName"].as<String>(), APP_NAME);
   if (!body["apAlways"].isNull()) settings.apAlways = body["apAlways"].as<bool>();
+  if (!body["dlnaEnabled"].isNull()) {
+    /*
+     * Refused rather than stored-and-ignored on a board without the
+     * renderer. A setting that saves and then does nothing is how a
+     * dashboard ends up showing a switch that is on next to a service that
+     * is not running.
+     */
+    const bool want = body["dlnaEnabled"].as<bool>();
+    if (want && !board_can(BOARD_CAP_DLNA)) {
+      sendError(409, board_why_not(BOARD_CAP_DLNA));
+      return;
+    }
+    settings.dlnaEnabled = want;
+    dlna_set_enabled(want);
+  }
   if (!body["apPassword"].isNull()) {
     const String password = body["apPassword"].as<String>();
     if (password.length() < 8) {
@@ -2660,6 +2714,7 @@ void handleSettingsBackup() {
   s["deviceName"] = settings.deviceName;
   s["ssid"] = settings.ssid;
   s["apAlways"] = settings.apAlways;
+  s["dlnaEnabled"] = settings.dlnaEnabled;
   s["githubRepo"] = settings.githubRepo;
   s["githubAsset"] = settings.githubAsset;
 
@@ -2864,6 +2919,16 @@ void handleSettingsBackup() {
 }
 
 void handleSettingsRestore() {
+  /*
+   * What this board could not accept from the file.
+   *
+   * Declared up here rather than beside each use because the reply at the end
+   * reports all of them together, and because a restore that silently drops
+   * something is worse than one that refuses: the owner gets the speaker they
+   * asked for minus a part they were never told about.
+   */
+  bool alarmsRetargeted = false;
+  bool dlnaDropped = false;
   if (!requireAuth()) return;
   JsonDocument body;
   if (!readBody(body)) return;
@@ -3024,6 +3089,14 @@ void handleSettingsRestore() {
   }
   if (!s["ssid"].isNull()) settings.ssid = s["ssid"].as<String>();
   if (!s["apAlways"].isNull()) settings.apAlways = s["apAlways"].as<bool>();
+  if (!s["dlnaEnabled"].isNull()) {
+    // A backup from a board that has the renderer, restored onto one that
+    // does not. Dropped rather than stored, for the same reason the radio
+    // stations are, and counted so the reply can say so.
+    const bool want = s["dlnaEnabled"].as<bool>();
+    settings.dlnaEnabled = want && board_can(BOARD_CAP_DLNA);
+    if (want && !settings.dlnaEnabled) dlnaDropped = true;
+  }
   if (!s["githubRepo"].isNull()) settings.githubRepo = s["githubRepo"].as<String>();
   if (!s["githubAsset"].isNull()) {
     settings.githubAsset = s["githubAsset"].as<String>();
@@ -3259,14 +3332,33 @@ void handleSettingsRestore() {
    * Replacing is what a restore means everywhere else in this file, and it is
    * the only behaviour that produces the speaker the backup describes.
    */
+  /*
+   * A backup taken from a WROVER and restored onto a WROOM.
+   *
+   * This is the path the capability model exists for. The file is valid, the
+   * owner did nothing wrong, and it describes a speaker with twelve radio
+   * favourites that this board cannot play. Silently writing them would leave a
+   * Radio page full of stations behind a feature that is not in the image;
+   * silently dropping them without saying so would look like the restore had
+   * failed. So they are dropped, counted, and reported in the reply.
+   */
+  uint8_t stationsDropped = 0;
+
   JsonArrayConst radioIn = s["radio"].as<JsonArrayConst>();
-  if (!radioIn.isNull() && net_radio_running()) {
-    while (net_radio_station_count()) net_radio_remove_station(0);
-    for (JsonObjectConst entry : radioIn) {
-      net_radio_set_station(RADIO_MAX_STATIONS, entry["name"] | "",
-                            entry["url"] | "");
+  if (!radioIn.isNull()) {
+    if (board_can(BOARD_CAP_NET_RADIO) && net_radio_running()) {
+      while (net_radio_station_count()) net_radio_remove_station(0);
+      for (JsonObjectConst entry : radioIn) {
+        net_radio_set_station(RADIO_MAX_STATIONS, entry["name"] | "",
+                              entry["url"] | "");
+      }
+      net_radio_store_stations();
+    } else {
+      stationsDropped = (uint8_t)radioIn.size();
+      LOGF("[restore] %u radio station(s) in the backup were not restored: "
+           "%s\n", (unsigned)stationsDropped,
+           board_why_not(BOARD_CAP_NET_RADIO));
     }
-    net_radio_store_stations();
   }
 
   JsonArrayConst alarmsIn = s["alarms"].as<JsonArrayConst>();
@@ -3280,6 +3372,21 @@ void handleSettingsRestore() {
       alarm.minute = (uint8_t)constrain(entry["minute"] | 0, 0, 59);
       alarm.days = (uint8_t)((entry["days"] | ALARM_WEEKDAYS) & ALARM_EVERY_DAY);
       alarm.source = (uint8_t)constrain(entry["source"] | 0, 0, ALARM_SRC_COUNT - 1);
+      /*
+       * A radio alarm on a board with no radio is an alarm that does not go
+       * off, and an alarm that does not go off is the worst failure this
+       * firmware has -- somebody is asleep behind it. Retargeted to the chime,
+       * which works in every profile including Bluetooth, and reported.
+       *
+       * Retargeted rather than dropped, deliberately: the owner asked to be
+       * woken at that time on those days, and that intent survives the change
+       * of hardware even though the choice of sound does not.
+       */
+      if (alarm.source == ALARM_SRC_RADIO && !board_can(BOARD_CAP_NET_RADIO)) {
+        alarm.source = ALARM_SRC_CHIME;
+        alarm.target = 0;
+        alarmsRetargeted = true;
+      }
       alarm.target = (uint8_t)constrain(entry["target"] | 0, 0, 99);
       alarm.volume = (uint8_t)constrain(entry["volume"] | 90, 0, 127);
       alarm.fadeSecs = (uint16_t)constrain(entry["fadeSeconds"] | 60, 0, 600);
@@ -3305,6 +3412,22 @@ void handleSettingsRestore() {
   JsonDocument reply;
   reply["ok"] = true;
   reply["message"] = "Settings restored; restarting";
+  // What could not come across, so the dashboard can say it plainly instead of
+  // leaving the owner to notice a missing station list on their own.
+  if (stationsDropped) {
+    reply["stationsDropped"] = stationsDropped;
+    reply["stationsDroppedReason"] = board_why_not(BOARD_CAP_NET_RADIO);
+  }
+  if (dlnaDropped) {
+    reply["dlnaDropped"] = true;
+    reply["dlnaDroppedReason"] = board_why_not(BOARD_CAP_DLNA);
+  }
+  if (alarmsRetargeted) {
+    reply["alarmsRetargeted"] = true;
+    reply["alarmsRetargetedReason"] =
+        "One or more alarms were set to an internet radio station. They now "
+        "use the built-in chime, which works on this board.";
+  }
   sendJson(reply);
   ui_show_system_status(UI_STATUS_RESTART, "Settings restored",
                         "Restarting speaker", -1, 0);
@@ -3478,10 +3601,342 @@ void handleAudioSave() {
  * the end of whatever the request asked for -- so reordering the list from the
  * dashboard is one erase cycle rather than one per move.
  */
+/*
+ * /api/capabilities -- what this board is, and why an option is not there.
+ *
+ * The dashboard renders its navigation from this. A WROOM does not draw a Radio
+ * page at all, a WROVER does, and neither of them has to know which board it is
+ * talking to in order to decide -- which matters because the same dashboard
+ * HTML is served by both, and because a page cached from one board must not
+ * offer controls on the other.
+ *
+ * Two rules this endpoint is written to.
+ *
+ * It never merely omits. Every capability that is off appears with a `reason`
+ * in words a person can act on, because "there is no Radio page" and "there is
+ * no Radio page because this is a WROOM build" are different amounts of help,
+ * and the second one is the difference between a bug report and an
+ * understanding. board_why_not() is the single source of those sentences, so
+ * the dashboard, the API errors and the serial log all say the same thing.
+ *
+ * And it is not the enforcement. Everything described here is also checked in
+ * the handler that would act on it -- see the capability check at the top of
+ * handleRadioPost(). This endpoint exists so the UI does not offer what will be
+ * refused; it is not what does the refusing. A client that ignores it entirely
+ * cannot get further than one that reads it.
+ *
+ * Unauthenticated deliberately: it names the hardware and the feature set, not
+ * the network, the credentials or anything about what is playing -- and the
+ * login page needs to know which product this is before anybody has a session.
+ * Nothing here is a secret and nothing here can change anything.
+ */
+void handleCapabilities() {
+  JsonDocument doc;
+  doc["ok"] = true;
+
+  // --- identity -----------------------------------------------------------
+  const BoardCaps &b = board_caps();
+  JsonObject board = doc["board"].to<JsonObject>();
+  board["target"] = BOARD_ENV_NAME;
+  board["module"] = BOARD_MODULE_NAME;
+  board["family"] = "esp32";  // classic ESP32, which is why A2DP exists here
+  board["chip"] = b.chip_model;
+  // MXX form, as esp_chip_info() reports it: 300 is v3.0. Sent as the raw
+  // number and as text so the dashboard does not have to do the division.
+  board["revision"] = b.chip_revision;
+  char rev[12];
+  snprintf(rev, sizeof(rev), "%u.%u", (unsigned)(b.chip_revision / 100),
+           (unsigned)(b.chip_revision % 100));
+  board["revisionText"] = rev;
+  board["firmware"] = FW_VERSION;
+
+  JsonObject flash = board["flash"].to<JsonObject>();
+  flash["physicalBytes"] = b.flash_physical_bytes;
+  flash["configuredBytes"] = b.flash_configured_bytes;
+  flash["ok"] = b.flash_ok;
+
+  /*
+   * Physical and mapped external RAM as two numbers, never one.
+   *
+   * On an N16R8 this reports roughly 8 MB fitted and roughly 4 MB usable, and
+   * that gap is the architecture rather than a fault: a classic ESP32 reaches
+   * external RAM through a 4 MiB window in the data bus, and the framework
+   * reserves part of that window for the banked himem API besides. Reporting
+   * only the physical figure is how a feature ends up budgeting memory it
+   * cannot address, so both are here and the dashboard shows both.
+   */
+  JsonObject psram = board["psram"].to<JsonObject>();
+  psram["present"] = b.psram_ok;
+  psram["physicalBytes"] = b.psram_physical_bytes;
+  psram["mappedBytes"] = b.psram_mapped_bytes;
+  psram["largestBlock"] =
+      b.psram_ok ? heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) : 0;
+  psram["expectedByBuild"] = BOARD_EXPECTS_PSRAM ? true : false;
+  if (!b.psram_ok) psram["reason"] = board_why_not(BOARD_CAP_PSRAM);
+
+  // The build expected hardware it did not find. Reported at the top level
+  // because it outranks every capability underneath it.
+  doc["degraded"] = b.degraded;
+  if (b.degraded) doc["degradedReason"] = b.degraded_reason;
+
+  // --- capabilities -------------------------------------------------------
+  JsonObject caps = doc["capabilities"].to<JsonObject>();
+  for (uint8_t i = 0; i < BOARD_CAP_COUNT; i++) {
+    const BoardCap cap = (BoardCap)i;
+    JsonObject entry = caps[board_cap_name(cap)].to<JsonObject>();
+    entry["available"] = board_can(cap);
+    if (!board_can(cap)) entry["reason"] = board_why_not(cap);
+  }
+
+  // --- the radio profile in force this boot -------------------------------
+  /*
+   * Profile and source are separate questions and are answered separately. The
+   * profile is which radio owns the antenna and cannot change without a reboot;
+   * the source is where the audio comes from within it.
+   */
+  JsonObject profile = doc["profile"].to<JsonObject>();
+  profile["id"] = (int)radioMode;
+  profile["name"] = management_mode_name(radioMode);
+  profile["wifi"] = radio_mode_has_wifi(radioMode);
+  profile["bluetooth"] = radio_mode_has_a2dp(radioMode);
+  profile["dfplayer"] = radio_mode_has_dfplayer(radioMode);
+
+  /*
+   * Which profiles this board will actually switch into, with a reason for each
+   * one it will not.
+   *
+   * The WROOM offers two ways to listen: Wi-Fi with the DFPlayer, and Bluetooth
+   * audio. Its Wi-Fi-only profile is still reachable -- it is the recovery
+   * profile the boot-strike fallback lands in, and the dashboard has to be able
+   * to say so -- but it is marked as carrying no audio rather than presented as
+   * a third way to play something, because in that profile nothing plays.
+   */
+  JsonArray profiles = doc["profiles"].to<JsonArray>();
+  for (uint8_t m = 0; m < RADIO_MODE_COUNT; m++) {
+    const RadioMode mode = (RadioMode)m;
+    JsonObject entry = profiles.add<JsonObject>();
+    entry["id"] = (int)mode;
+    entry["name"] = management_mode_name(mode);
+    entry["current"] = mode == radioMode;
+
+    bool offerable = true;
+    const char *why = "";
+    if (mode == RADIO_MODE_DFPLAYER && !DFPLAYER_ENABLED) {
+      offerable = false;
+      why = "The DFPlayer driver was not compiled into this build.";
+    } else if (mode == RADIO_MODE_MANAGEMENT &&
+               !board_can(BOARD_CAP_NET_RADIO)) {
+      entry["audio"] = false;
+      entry["note"] = "Dashboard and updates only -- no audio source in this "
+                      "profile on this board. Use Wi-Fi + DFPlayer to listen "
+                      "to the card or a USB stick.";
+    }
+    entry["offerable"] = offerable;
+    if (!offerable) entry["reason"] = why;
+  }
+
+  // --- detected hardware --------------------------------------------------
+  /*
+   * What this boot actually found, as opposed to what is wired in the pin map.
+   *
+   * Every optional part of this speaker is absent-tolerant, which has the one
+   * cost that a peripheral fitted but not working looks exactly like one that
+   * was never fitted. This is where that distinction is made visible.
+   */
+  JsonObject hw = doc["hardware"].to<JsonObject>();
+  hw["oled"] = ui_present();
+  hw["rtc"] = soft_clock_rtc_state_name();
+  hw["leds"] = LEDS_ENABLED && PIN_LEDS >= 0;
+  hw["ledCount"] = LEDS_ENABLED ? LED_COUNT : 0;
+  hw["battery"] = battery_present();
+  JsonObject df = hw["dfplayer"].to<JsonObject>();
+  df["built"] = DFPLAYER_ENABLED ? true : false;
+  df["running"] = df_player_running();
+  /*
+   * The UART pin map, reported per target.
+   *
+   * This is the one signal that is wired differently on the two boards -- a
+   * WROVER-E commits GPIO16/17 to its PSRAM chip, so the DFPlayer's serial link
+   * moves to GPIO13/19 there. Reported so the board in your hand can be checked
+   * against the board the firmware thinks it is talking to, which is the first
+   * thing to look at when a module does not answer.
+   */
+  df["pinTx"] = PIN_DF_TX;
+  df["pinRx"] = PIN_DF_RX;
+  df["pinBusy"] = PIN_DF_BUSY;
+
+  // --- supported media ----------------------------------------------------
+  /*
+   * An exact matrix rather than a claim.
+   *
+   * Only what has a decoder in this image is listed: arduino-libhelix supplies
+   * fixed-point MP3 and AAC and nothing else, so Ogg, Opus, FLAC and WAV are
+   * absent -- not "not yet", absent, because no decoder for any of them fits in
+   * what is left of the heap in a Wi-Fi profile. Publishing the real list is
+   * how a station that will not play stops being a mystery.
+   */
+  JsonObject media = doc["media"].to<JsonObject>();
+  JsonArray codecs = media["codecs"].to<JsonArray>();
+#if CAP_NET_RADIO
+  {
+    JsonObject mp3 = codecs.add<JsonObject>();
+    mp3["codec"] = "MP3";
+    mp3["container"] = "raw / ICY";
+    mp3["sampleRates"] = "32000, 44100, 48000";
+    mp3["bitrateMax"] = 320;
+    mp3["note"] = "The measured baseline. 128 kbps is what the buffer is sized "
+                  "around.";
+    JsonObject aac = codecs.add<JsonObject>();
+    aac["codec"] = "AAC-LC";
+    aac["container"] = "ADTS";
+    aac["sampleRates"] = "32000, 44100, 48000";
+    aac["bitrateMax"] = 256;
+    aac["note"] = "HE-AAC v2 streams announce themselves as AAC and will not "
+                  "decode.";
+  }
+  media["schemes"] = "http, https";
+  media["httpsNote"] =
+      "One TLS session exists on this chip at a time, and the firmware updater "
+      "shares it. An https station waits out a backoff while an update runs.";
+#else
+  media["schemes"] = "";
+  media["reason"] = board_why_not(BOARD_CAP_NET_RADIO);
+#endif
+  /*
+   * The renderer, described as three separate facts, because a controller that
+   * cannot find the speaker has three different possible reasons and the
+   * dashboard should not make the owner guess which.
+   */
+  JsonObject dlna = media["dlna"].to<JsonObject>();
+  dlna["supported"] = board_can(BOARD_CAP_DLNA);
+#if CAP_DLNA
+  if (!board_can(BOARD_CAP_DLNA)) {
+    dlna["reason"] = board_why_not(BOARD_CAP_DLNA);
+  } else {
+    DlnaStatus d;
+    dlna_snapshot(&d);
+    dlna["enabled"] = d.enabled;
+    dlna["running"] = d.running;
+    dlna["port"] = d.port;
+    dlna["name"] = dlna_friendly_name();
+    // Renderer only. Saying so here stops a controller author, or an owner
+    // reading the API, expecting it to browse or serve anything.
+    dlna["role"] = "MediaRenderer";
+    dlna["profile"] = "DMR-1.50";
+  }
+#else
+  /*
+   * The #if is not belt-and-braces over the runtime check above; it is what
+   * keeps the strings out of the image. board_can() is false on this target
+   * either way, but a literal inside a branch that never runs is still a
+   * literal in flash -- "MediaRenderer" and "DMR-1.50" were both findable in a
+   * WROOM binary until this guard existed, which is a small waste and a
+   * misleading one to anybody grepping the image for what it can do.
+   */
+  dlna["reason"] = board_why_not(BOARD_CAP_DLNA);
+#endif
+
+  sendJson(doc);
+}
+
+/*
+ * /api/dlna -- the renderer's switch and what it is doing.
+ *
+ * Authenticated, unlike the renderer itself. That asymmetry is the point: UPnP
+ * has no authentication and cannot be given any, so the control that matters is
+ * whether it is running at all, and that control lives behind the dashboard's
+ * password.
+ */
+void handleDlnaGet() {
+  if (!requireAuth()) return;
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["supported"] = board_can(BOARD_CAP_DLNA);
+#if !CAP_DLNA
+  // The endpoint still exists on a board without the renderer, and answers
+  // rather than 404s: the dashboard asks before deciding whether to draw the
+  // card, and "not on this board, here is why" is a better answer than a
+  // missing route.
+  doc["reason"] = board_why_not(BOARD_CAP_DLNA);
+  sendJson(doc);
+}
+#else
+  if (!board_can(BOARD_CAP_DLNA)) {
+    doc["reason"] = board_why_not(BOARD_CAP_DLNA);
+    sendJson(doc);
+    return;
+  }
+
+  DlnaStatus d;
+  dlna_snapshot(&d);
+  doc["enabled"] = d.enabled;
+  doc["running"] = d.running;
+  doc["name"] = dlna_friendly_name();
+  doc["port"] = d.port;
+  doc["modeHasWifi"] = radio_mode_has_wifi(radioMode);
+  const char *state = "stopped";
+  switch (d.transport) {
+    case DLNA_PLAYING: state = "playing"; break;
+    case DLNA_PAUSED: state = "paused"; break;
+    case DLNA_TRANSITIONING: state = "opening"; break;
+    default: break;
+  }
+  doc["transport"] = state;
+  doc["uri"] = d.uri;
+  doc["title"] = d.title;
+  doc["controller"] = d.controller;
+  doc["volume"] = d.volume;
+  doc["muted"] = d.muted;
+  doc["subscriptions"] = d.subscriptions;
+  doc["actions"] = d.requests;
+  /*
+   * The formats a controller may send, verbatim from what the decoders can do.
+   * The dashboard shows this next to the switch, because "it appeared and then
+   * would not play my FLAC" is the question this answers before it is asked.
+   */
+  doc["formats"] = "MP3 and AAC-LC over http";
+  sendJson(doc);
+}
+#endif
+
+void handleDlnaPost() {
+  if (!requireAuth()) return;
+  if (!board_can(BOARD_CAP_DLNA)) {
+    sendError(409, board_why_not(BOARD_CAP_DLNA));
+    return;
+  }
+  JsonDocument body;
+  if (!readBody(body)) return;
+
+  if (!body["enabled"].isNull()) {
+    settings.dlnaEnabled = body["enabled"].as<bool>();
+    dlna_set_enabled(settings.dlnaEnabled);
+    saveSettings();
+  }
+  if ((body["action"] | "") == "stop") dlna_stop();
+  handleDlnaGet();
+}
+
 void handleRadioGet() {
   if (!requireAuth()) return;
   JsonDocument doc;
   doc["ok"] = true;
+  /*
+   * Three different negatives, kept apart because they need different words on
+   * the screen and a different decision from the reader.
+   *
+   *   supported  this board and this build can do internet radio at all. False
+   *              on a WROOM, where the code is not in the image -- so the
+   *              dashboard should not render a Radio page rather than render a
+   *              broken one.
+   *   available  supported, and the driver started this boot. False when the
+   *              buffer could not be allocated, which is a memory problem to
+   *              go and read the log about.
+   *   modeHasWifi the current radio profile has a network at all.
+   */
+  doc["supported"] = board_can(BOARD_CAP_NET_RADIO);
+  if (!board_can(BOARD_CAP_NET_RADIO))
+    doc["reason"] = board_why_not(BOARD_CAP_NET_RADIO);
   doc["available"] = net_radio_running();
   doc["modeHasWifi"] = radio_mode_has_wifi(radioMode);
   doc["maxStations"] = RADIO_MAX_STATIONS;
@@ -3525,6 +3980,24 @@ void handleRadioPost() {
   JsonDocument body;
   if (!readBody(body)) return;
   const String action = body["action"] | "";
+
+  /*
+   * The capability check comes before everything, including the read of
+   * `action`, and it is the one that matters.
+   *
+   * On a WROOM build net_radio_running() is a stub that returns false, so the
+   * check below would already refuse -- but it would refuse with the wrong
+   * reason, telling the owner to go and read a serial log about a memory
+   * allocation that never happened. This is also the check that a request
+   * arriving from somewhere the dashboard does not control has to pass: a
+   * restored backup, an imported preset, an MQTT topic, a scheduled alarm.
+   * Rendering controls from capabilities is a convenience; refusing here is
+   * the enforcement.
+   */
+  if (!board_can(BOARD_CAP_NET_RADIO)) {
+    sendError(409, board_why_not(BOARD_CAP_NET_RADIO));
+    return;
+  }
 
   if (!net_radio_running()) {
     sendError(409, radio_mode_has_wifi(radioMode)
@@ -3688,6 +4161,21 @@ void handleAlarmsPost() {
     if (!body["days"].isNull()) alarm.days = (uint8_t)(body["days"].as<int>() & ALARM_EVERY_DAY);
     if (!body["source"].isNull()) {
       alarm.source = (uint8_t)constrain(body["source"].as<int>(), 0, ALARM_SRC_COUNT - 1);
+      /*
+       * Refused rather than quietly retargeted, which is the opposite of what
+       * a restore does two hundred lines up -- and the difference is who is
+       * asking.
+       *
+       * A restore is a file describing a speaker that no longer exists, and
+       * the owner is not watching the field they are about to lose. Here
+       * somebody is looking at the form: they picked a source, they are about
+       * to be told it is not available on this board, and they can pick
+       * another one. Saving something they did not choose would be worse.
+       */
+      if (alarm.source == ALARM_SRC_RADIO && !board_can(BOARD_CAP_NET_RADIO)) {
+        sendError(409, board_why_not(BOARD_CAP_NET_RADIO));
+        return;
+      }
     }
     if (!body["target"].isNull()) alarm.target = (uint8_t)constrain(body["target"].as<int>(), 0, 99);
     if (!body["volume"].isNull()) alarm.volume = (uint8_t)constrain(body["volume"].as<int>(), 0, 127);
@@ -4289,6 +4777,9 @@ void configureRoutes() {
   });
   server.on("/api/auth", HTTP_GET, handleAuth);
   server.on("/api/status", HTTP_GET, handleStatus);
+  // Unauthenticated: hardware and feature set only, and the login page needs
+  // it before there is a session. See the note on handleCapabilities().
+  server.on("/api/capabilities", HTTP_GET, handleCapabilities);
   server.on("/api/media", HTTP_POST, handleMedia);
   server.on("/api/devices", HTTP_GET, handleDevices);
   server.on("/api/devices", HTTP_POST, handleDeviceAction);
@@ -4306,6 +4797,8 @@ void configureRoutes() {
   server.on("/api/clock", HTTP_POST, handleClock);
   server.on("/api/audio", HTTP_GET, handleAudioGet);
   server.on("/api/audio", HTTP_POST, handleAudioSave);
+  server.on("/api/dlna", HTTP_GET, handleDlnaGet);
+  server.on("/api/dlna", HTTP_POST, handleDlnaPost);
   server.on("/api/radio", HTTP_GET, handleRadioGet);
   server.on("/api/radio", HTTP_POST, handleRadioPost);
   server.on("/api/alarms", HTTP_GET, handleAlarmsGet);
@@ -4569,6 +5062,18 @@ void management_begin(BluetoothA2DPSink &a2dp) {
    * reach.
    */
   applyAudioSettings();
+
+  /*
+   * Hand the stored renderer setting to dlna.cpp, in the Wi-Fi profiles only.
+   *
+   * Not in Bluetooth mode, and not conditionally-with-a-comment: in that
+   * profile there is no network at all, and telling the renderer it is enabled
+   * would leave dlna_loop() polling WiFi.status() forever for a station that is
+   * never going to exist. The setting is remembered and applies again the next
+   * time a Wi-Fi profile boots.
+   */
+  if (radio_mode_has_wifi(radioMode) && board_can(BOARD_CAP_DLNA))
+    dlna_set_enabled(settings.dlnaEnabled);
 
   if (radioMode == RADIO_MODE_BLUETOOTH) {
     // Not one Wi-Fi call. Leaving the driver uninitialised is the point: the

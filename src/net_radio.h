@@ -61,6 +61,22 @@
 
 #pragma once
 
+/*
+ * Whether any of this exists in the build.
+ *
+ * Internet radio is a WROVER capability. On a WROOM build the whole of
+ * net_radio.cpp is compiled to nothing and the declarations below become inline
+ * stubs that answer "no" -- so every caller still compiles, the linker drops
+ * the decoders with it, and there is no endpoint, no MQTT topic, no alarm
+ * target and no restored preset that can reach a radio that is not there.
+ *
+ * That last part is the point. A dashboard that hides a control is a
+ * convenience; a binary that does not contain the feature is a guarantee, and
+ * it is what the operating-mode matrix asks for. -DWROOM_ALLOW_RADIO=1 puts it
+ * back on the WROOM exactly as it shipped. See src/board_caps.h.
+ */
+#include "board_caps.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -127,6 +143,8 @@ struct RadioStatus {
   uint32_t stateSince;
   uint32_t bytes;        ///< received on this connection, for a rough rate readout
 };
+
+#if CAP_NET_RADIO
 
 /*
  * Starts the driver.
@@ -248,3 +266,56 @@ const char *net_radio_screen_line();
 /// Serial console: "radio stations", "radio play <n>", "radio stop",
 /// "radio next|prev". Returns false if the line was something else.
 bool net_radio_command(const char *line);
+
+#else  // !CAP_NET_RADIO
+/*
+ * The radio, absent.
+ *
+ * Every declaration above has an inline stub here that answers the honest
+ * negative: nothing is running, nothing can be started, there are no stations,
+ * and no command line was understood. Inline and trivial, so the compiler folds
+ * them away at every call site -- a `if (net_radio_running())` block costs
+ * nothing and the linker drops whatever was inside it.
+ *
+ * Written out rather than hidden behind a macro because the shape of the API is
+ * the contract, and a stub list that has drifted from the real declarations is
+ * a build error here rather than a mystery somewhere else.
+ *
+ * net_radio_state_name() answers "off" instead of "idle" on purpose. Idle is a
+ * radio that has been asked for nothing; this is a radio that does not exist,
+ * and the dashboard should not be able to render the two the same way.
+ */
+
+inline bool net_radio_begin(void *) { return false; }
+inline bool net_radio_running() { return false; }
+inline void net_radio_loop() {}
+inline bool net_radio_active() { return false; }
+inline void net_radio_snapshot(RadioStatus *out) {
+  if (!out) return;
+  *out = RadioStatus{};
+  out->state = RADIO_IDLE;
+  out->station = -1;
+}
+inline bool net_radio_play_station(uint8_t) { return false; }
+inline bool net_radio_play_url(const char *, const char *) { return false; }
+inline void net_radio_stop() {}
+inline bool net_radio_toggle() { return false; }
+inline bool net_radio_step_station(bool) { return false; }
+inline void net_radio_set_volume(uint8_t) {}
+inline uint8_t net_radio_volume() { return 0; }
+inline bool net_radio_autostart() { return false; }
+inline void net_radio_set_autostart(bool) {}
+inline uint8_t net_radio_station_count() { return 0; }
+inline bool net_radio_station(uint8_t, RadioStation *) { return false; }
+inline bool net_radio_set_station(uint8_t, const char *, const char *) {
+  return false;
+}
+inline bool net_radio_remove_station(uint8_t) { return false; }
+inline bool net_radio_move_station(uint8_t, bool) { return false; }
+inline void net_radio_store_stations() {}
+inline const char *net_radio_state_name(RadioState) { return "off"; }
+inline bool net_radio_screen_wanted() { return false; }
+inline const char *net_radio_screen_line() { return ""; }
+inline bool net_radio_command(const char *) { return false; }
+
+#endif  // CAP_NET_RADIO

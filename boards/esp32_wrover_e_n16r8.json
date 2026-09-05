@@ -1,0 +1,58 @@
+{
+  "_comment": [
+    "ESP32-WROVER-E-N16R8: classic ESP32-D0WD-V3 die, 16 MB flash, 8 MB PSRAM.",
+    "",
+    "Project-local because nothing shipped describes it. esp-wrover-kit is the",
+    "FTDI development kit with 4 MB of flash and a debug probe; upesy_wrover is",
+    "a different board with a different variant directory. Both would declare",
+    "the wrong flash size and the wrong upload tooling.",
+    "",
+    "variant stays \"esp32\" -- the generic classic-ESP32 pin variant. A WROVER-E",
+    "module has the same bonded-out pins as a WROOM-32D except that GPIO16 and",
+    "GPIO17 are committed to the PSRAM chip, and that is a firmware pin-map",
+    "question rather than a core variant question. See hw_config.h.",
+    "",
+    "extra_flags deliberately does NOT include -mfix-esp32-psram-cache-issue.",
+    "The stock WROVER manifests do, and for an ESP32 revision below 3 they must:",
+    "the cache erratum is real on that silicon. A WROVER-E carries the D0WD-V3",
+    "die, revision 3, where it is fixed -- so the barriers cost throughput on",
+    "the audio path and IRAM in the image for a bug this part does not have.",
+    "This is checked rather than assumed: board_caps_begin() reads the chip",
+    "revision at boot and marks the board degraded if it is below 3, because",
+    "un-barriered code touching PSRAM on that silicon is genuinely unsafe.",
+    "",
+    "-DBOARD_HAS_PSRAM is what the Arduino core and the libraries look at to",
+    "decide whether ps_malloc() is real. It is not what enables PSRAM: that is",
+    "CONFIG_SPIRAM=y in the precompiled framework libraries, which is already",
+    "set for every esp32 build, with psramInit() running from a system init",
+    "hook and psramAddToHeap() from initArduino(). One flag alone was never",
+    "the whole story here."
+  ],
+  "build": {
+    "core": "esp32",
+    "extra_flags": [
+      "-DARDUINO_ESP32_DEV",
+      "-DBOARD_HAS_PSRAM"
+    ],
+    "f_cpu": "240000000L",
+    "f_flash": "40000000L",
+    "flash_mode": "dio",
+    "mcu": "esp32",
+    "variant": "esp32"
+  },
+  "connectivity": ["wifi", "bluetooth"],
+  "debug": {
+    "openocd_board": "esp32-wrover.cfg"
+  },
+  "frameworks": ["arduino"],
+  "name": "ESP32-WROVER-E-N16R8 (16 MB flash, 8 MB PSRAM)",
+  "upload": {
+    "flash_size": "16MB",
+    "maximum_ram_size": 327680,
+    "maximum_size": 6553600,
+    "require_upload_port": true,
+    "speed": 460800
+  },
+  "url": "https://www.espressif.com/sites/default/files/documentation/esp32-wrover-e_esp32-wrover-ie_datasheet_en.pdf",
+  "vendor": "Espressif"
+}

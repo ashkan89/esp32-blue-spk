@@ -27,7 +27,12 @@
  *                                        practice: without it the module picks
  *                                        up switching noise and answers frames
  *                                        that were never sent.
- *   3  TX             GPIO16             3.3 V logic, connect directly
+ *                                        WROVER-E: GPIO13 instead -- 17 is the
+ *                                        PSRAM clock. See the pin-map note
+ *                                        further down.
+ *   3  TX             GPIO16             3.3 V logic, connect directly.
+ *                                        WROVER-E: GPIO19 instead -- 16 is the
+ *                                        PSRAM chip select.
  *   4  DAC_R          output stage R     line level, ~1 Vrms
  *   5  DAC_L          output stage L
  *   6  SPK2           not connected      the on-board 3 W amp is unused
@@ -110,6 +115,70 @@
 
 #include <stdint.h>
 
+// For BOARD_TARGET, which the DFPlayer UART pins below are keyed on. This is
+// the only place in the firmware where the two boards are wired differently.
+#include "board_caps.h"
+
+/*
+ * ===========================================================================
+ * THE WROVER PIN MAP, AND THE ONE THING THAT MOVES
+ * ===========================================================================
+ *
+ * Everything in this file and in ui_config.h is identical on both targets with
+ * exactly one exception: the DFPlayer's serial link.
+ *
+ * An ESP32-WROVER-E wires GPIO16 and GPIO17 to the PSRAM chip -- 16 is its chip
+ * select and 17 its clock -- and they are committed from the moment the
+ * bootloader initialises external RAM. They are not "in use by a peripheral we
+ * could turn off": the module's own routing owns them, and driving either from
+ * the GPIO matrix breaks PSRAM rather than sharing the pin. That is why this
+ * firmware's UART2 pair has to move on that board, and it is the only rewire
+ * the second target needs.
+ *
+ * Nothing is remapped silently. The WROOM keeps 16/17 exactly as it has always
+ * had them, pin_check.h refuses to compile a WROVER build that still points at
+ * them, and both maps are printed by `diag` and by the dashboard's hardware
+ * page so the board in your hand can be checked against the board the firmware
+ * thinks it is talking to.
+ *
+ *   Signal           WROOM-32D    WROVER-E    Why the WROVER differs
+ *   ---------------  -----------  ----------  ------------------------------
+ *   DFPlayer TX      GPIO17       GPIO13      17 is the PSRAM clock
+ *   DFPlayer RX      GPIO16       GPIO19      16 is the PSRAM chip select
+ *   everything else  unchanged    unchanged
+ *
+ * GPIO13 and GPIO19 rather than the other pins that are free, and the choice
+ * was made by elimination rather than by preference:
+ *
+ *   GPIO12   rejected. It is the flash-voltage strapping pin (MTDI), sampled at
+ *            every reset, and holding it high on a 3.3 V module can stop the
+ *            board booting at all. The DFPlayer's TX line idles HIGH, so wiring
+ *            it here would do exactly that -- intermittently, and with no
+ *            serial log to read, because the chip never gets far enough to open
+ *            one. This is the single worst available choice and it is the one
+ *            that looks most natural on a pinout diagram.
+ *   GPIO15   rejected. Strapping pin (MTDO), which selects whether the ROM
+ *            bootloader prints at all. Usable, but there is no reason to spend
+ *            a strapping pin when two plain ones are free.
+ *   GPIO5    rejected for the same reason -- also a strapping pin (SDIO slave
+ *            timing) -- and kept free deliberately: it is the best remaining
+ *            output-capable pin for the rotary encoder in the hardware
+ *            roadmap.
+ *   GPIO36   } input-only, so neither can carry TX. GPIO36 is also
+ *   GPIO39   } the only other ADC1 channel left for a second analog sense.
+ *   GPIO37   not bonded out on a WROVER-E package. Configuring it succeeds and
+ *   GPIO38   nothing ever happens, which is the hardest kind of fault to find.
+ *   GPIO1    UART0, the programming and console port. Using GPIO3 in particular
+ *   GPIO3    can hold the chip in reset through a devkit's auto-reset circuit.
+ *
+ * That leaves GPIO13 (JTAG MTCK, otherwise plain) and GPIO19 (plain), neither
+ * strapped, neither input-only, both bonded out. TX takes 13 because it is the
+ * one that has to drive; RX takes 19.
+ *
+ * Free and unclaimed on the WROVER after this: GPIO5, GPIO12, GPIO15, GPIO36,
+ * GPIO39. See the hardware roadmap in the README before spending any of them.
+ */
+
 // =========================================================== DFPlayer Mini ===
 
 /// Compile the DFPlayer driver in at all. 0 removes the mode, the API and the
@@ -118,13 +187,30 @@
 #define DFPLAYER_ENABLED 1
 #endif
 
-/// UART2. Any two free pins work -- the ESP32's UARTs are on the GPIO matrix --
-/// but 16/17 are the historical UART2 pair and are free on this board.
+/*
+ * UART2. Any two free pins work -- the ESP32's UARTs are on the GPIO matrix --
+ * which is what makes the WROVER's move a one-line change rather than a
+ * redesign. See the pin-map note above for why these two pins and not others.
+ *
+ * Both are still overridable from build_flags on either target:
+ *
+ *     build_flags = -DPIN_DF_TX=27 -DPIN_DF_RX=14
+ */
+#if BOARD_IS_WROVER
+#ifndef PIN_DF_TX
+#define PIN_DF_TX 13  // ESP32 out -> module RX (through 1k). 17 is PSRAM CLK.
+#endif
+#ifndef PIN_DF_RX
+#define PIN_DF_RX 19  // ESP32 in  <- module TX.             16 is PSRAM CS.
+#endif
+#else
+/// 16/17 are the historical UART2 pair and are free on the WROOM.
 #ifndef PIN_DF_TX
 #define PIN_DF_TX 17  // ESP32 out -> module RX (through 1k)
 #endif
 #ifndef PIN_DF_RX
 #define PIN_DF_RX 16  // ESP32 in  <- module TX
+#endif
 #endif
 
 /// 9600 8N1 is the only rate the YX5200 speaks. Listed because it looks like a

@@ -118,14 +118,73 @@
 /// A pin that is switched off with -1 passes everything.
 #define PIN_OFF(p) ((p) < 0)
 
+/*
+ * True for the two pins an ESP32-WROVER-E commits to its PSRAM chip, and only
+ * on a build that expects PSRAM.
+ *
+ * GPIO16 is the PSRAM chip select and GPIO17 its clock. They are owned by the
+ * module's own routing from the moment the bootloader brings external RAM up,
+ * and driving either from the GPIO matrix does not share the pin -- it breaks
+ * PSRAM, which on a WROVER build means it breaks the stream buffer, the caches
+ * and the recovery path that was supposed to notice. The failure is a heap that
+ * is quietly the wrong size, which is a long way from where anyone would look.
+ *
+ * On the WROOM this is always false: 16/17 are ordinary pins there and are the
+ * DFPlayer's UART, exactly as they have always been. That is the whole reason
+ * this predicate is conditional rather than a flat rule -- the same map cannot
+ * be right for both boards, and the compiler is the right thing to be holding
+ * the difference.
+ */
+#if BOARD_EXPECTS_PSRAM
+#define PIN_IS_PSRAM(p) ((p) == 16 || (p) == 17)
+#else
+#define PIN_IS_PSRAM(p) 0
+#endif
+
 /// The two shapes every check below takes.
 #define PIN_OK_ANY(p) (PIN_OFF(p) || (PIN_EXISTS(p) && !PIN_IS_FLASH(p)))
 #define PIN_OK_OUTPUT(p) (PIN_OK_ANY(p) && !PIN_IS_INPUT_ONLY(p))
+
+/*
+ * The PSRAM check, given its own assertion per pin rather than folded into the
+ * two predicates above.
+ *
+ * Folding it in was tried and is worse. It covers every pin for free, but then
+ * a WROVER build with the DFPlayer still on GPIO17 fails twice: once with the
+ * message below, and once with "34-39 are input only" -- which is not true of
+ * GPIO17 and sends the reader somewhere there is nothing to find. One cause
+ * should produce one error, and it should name the cause.
+ */
+#define PIN_ASSERT_NOT_PSRAM(pin, name)                                         static_assert(!PIN_IS_PSRAM(pin),                                                           name " is on GPIO16 or GPIO17. An ESP32-WROVER-E commits both "                 "to its PSRAM chip -- 16 is the chip select, 17 the clock -- "                  "and driving either does not share the pin, it breaks external "                 "RAM. Move it (hw_config.h has the free pins for this board) "                  "or build the esp32_wroom_32d_16mb target instead.")
 
 /// Two pins collide when they are both in use and equal. -1 never collides.
 #define PINS_DISTINCT(a, b) (PIN_OFF(a) || PIN_OFF(b) || (a) != (b))
 
 // ================================================================= existence ==
+
+/*
+ * Every other pin in the firmware, against the same rule.
+ *
+ * None of these is at risk today -- the DFPlayer's UART was the only signal on
+ * 16/17 -- and they are here anyway, because the next person to move a pin will
+ * be reading a wiring table rather than this file, and the compiler is the only
+ * thing that reads all of it at once.
+ */
+PIN_ASSERT_NOT_PSRAM(PIN_MAP_I2S_BCLK, "I2S BCLK");
+PIN_ASSERT_NOT_PSRAM(PIN_MAP_I2S_LRCK, "I2S LRCK");
+PIN_ASSERT_NOT_PSRAM(PIN_MAP_I2S_DOUT, "I2S DOUT");
+PIN_ASSERT_NOT_PSRAM(PIN_OLED_SDA, "I2C SDA");
+PIN_ASSERT_NOT_PSRAM(PIN_OLED_SCL, "I2C SCL");
+PIN_ASSERT_NOT_PSRAM(PIN_STATUS_LED, "The status LED");
+PIN_ASSERT_NOT_PSRAM(PIN_UI_BUTTON, "The UI button");
+#if LEDS_ENABLED
+PIN_ASSERT_NOT_PSRAM(PIN_LEDS, "The WS2812 data line");
+#endif
+#if BATTERY_ENABLED
+PIN_ASSERT_NOT_PSRAM(PIN_BATTERY_SENSE, "The battery sense pin");
+PIN_ASSERT_NOT_PSRAM(PIN_BATTERY_CHARGING, "The TP4056 CHRG pin");
+PIN_ASSERT_NOT_PSRAM(PIN_BATTERY_FULL, "The TP4056 STDBY pin");
+#endif
 
 static_assert(PIN_OK_OUTPUT(PIN_MAP_I2S_BCLK),
               "I2S BCLK is on a flash, input-only or non-existent pin");
@@ -156,9 +215,30 @@ static_assert(LED_CENTRE_INDEX < LED_COUNT,
 #endif
 
 #if DFPLAYER_ENABLED
+/*
+ * The PSRAM collision, named.
+ *
+ * A WROVER build that still has the WROOM's UART pins is the one mistake this
+ * whole second target makes easy to commit: the map compiles, the module even
+ * answers for a while, and what actually breaks is external RAM -- somewhere
+ * else entirely, with a heap that is silently the wrong size. Caught here
+ * instead, by name, with the fix in the message.
+ */
+PIN_ASSERT_NOT_PSRAM(PIN_DF_TX, "The DFPlayer TX line");
+PIN_ASSERT_NOT_PSRAM(PIN_DF_RX, "The DFPlayer RX line");
+PIN_ASSERT_NOT_PSRAM(PIN_DF_BUSY, "The DFPlayer BUSY line");
+PIN_ASSERT_NOT_PSRAM(PIN_DF_IO1, "DFPlayer IO1");
+PIN_ASSERT_NOT_PSRAM(PIN_DF_IO2, "DFPlayer IO2");
+PIN_ASSERT_NOT_PSRAM(PIN_DF_ADKEY1, "DFPlayer ADKEY1");
+PIN_ASSERT_NOT_PSRAM(PIN_DF_ADKEY2, "DFPlayer ADKEY2");
+PIN_ASSERT_NOT_PSRAM(PIN_DF_LED, "The DFPlayer indicator LED");
+PIN_ASSERT_NOT_PSRAM(PIN_DF_USB_DETECT, "The DFPlayer USB-detect line");
+
 static_assert(PIN_OK_OUTPUT(PIN_DF_TX),
               "the DFPlayer TX line must be able to drive; 34-39 are input only");
 static_assert(PIN_OK_ANY(PIN_DF_RX), "the DFPlayer RX line is on an unusable pin");
+static_assert(PINS_DISTINCT(PIN_DF_TX, PIN_DF_RX),
+              "the DFPlayer TX and RX lines cannot share one pin");
 static_assert(PIN_OK_ANY(PIN_DF_BUSY),
               "the DFPlayer BUSY line is on an unusable pin");
 static_assert(PIN_OK_ANY(PIN_DF_USB_DETECT),

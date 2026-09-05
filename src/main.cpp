@@ -68,10 +68,12 @@
 #include "app_config.h"
 #include "alarm_clock.h"
 #include "audio_eq.h"
+#include "board_caps.h"
 #include "audio_probe.h"
 #include "battery.h"
 #include "df_player.h"
 #include "diagnostics.h"
+#include "dlna.h"
 #include "hw_config.h"
 #include "leds.h"
 #include "home_assistant.h"
@@ -272,6 +274,7 @@ static void poll_console() {
     // "station" rather than "radio": radio_command() above already owns "radio"
     // for the mode switch, and one word cannot mean both.
     if (net_radio_command(buf)) continue;
+    if (dlna_command(buf)) continue;
     if (alarm_command(buf)) continue;
     if (telemetry_command(buf)) continue;
     if (ha_command(buf)) continue;
@@ -1221,6 +1224,20 @@ void setup() {
                 reset_reason_text(esp_reset_reason()),
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
 
+  /*
+   * The board, before anything allocates.
+   *
+   * Two reasons for it being the first thing after the log opens. The internal
+   * heap baseline it records is only meaningful while nothing has taken its
+   * share yet -- every later measurement in `diag` is read against it. And
+   * every allocation decision from here on asks it what this board can do:
+   * whether there is external RAM, whether the flash is the size the build was
+   * told, and therefore which features are offered at all. A capability
+   * answered after the buffer was allocated would be answering the wrong
+   * question.
+   */
+  board_caps_begin();
+
   status_led_begin(PIN_STATUS_LED, STATUS_LED_ACTIVE_HIGH);
 
   AudioLogger::instance().begin(Serial, AudioLogger::Warning);
@@ -1347,8 +1364,42 @@ void setup() {
    * in Wi-Fi mode nothing else is writing to it, which is exactly why there is
    * room for a radio there.
    */
+  /*
+   * The capability check as well as the mode check, and the second one is not
+   * redundant.
+   *
+   * On a WROOM build net_radio_begin() is an inline stub and this costs nothing.
+   * The case that matters is a WROVER whose external RAM did not initialise:
+   * the code IS in the image, the mode does have Wi-Fi, and starting the radio
+   * would create its task and reach for a stream buffer that cannot be had.
+   * board_can() has already answered no and the dashboard is already saying so
+   * -- starting it anyway would make the dashboard a liar and the failure a
+   * null pointer somewhere in a decoder.
+   */
   if (radio_mode_has_wifi(management_radio_mode())) {
-    net_radio_begin(&i2s);
+    if (board_can(BOARD_CAP_NET_RADIO)) {
+      net_radio_begin(&i2s);
+    } else if (CAP_NET_RADIO) {
+      // Compiled in but unavailable on this board, which is worth one line:
+      // "no radio page" on a build that has one is otherwise a mystery.
+      LOGF("[radio] not started: %s\n", board_why_not(BOARD_CAP_NET_RADIO));
+    }
+
+    /*
+     * The UPnP/DLNA renderer, in both profiles that have a network.
+     *
+     * Not only the Wi-Fi-only one. A speaker in Wi-Fi + DFPlayer mode is on
+     * the network and has the decoder, so there is no reason a controller
+     * should not be able to push a track at it -- and whichever source was
+     * playing stops when the other starts, which is enforced in
+     * startPlayback() in dlna.cpp rather than assumed here.
+     *
+     * dlna_begin() returns false quietly when the owner has not enabled it,
+     * which is the default and the right one: UPnP has no authentication.
+     * dlna_loop() brings it up later once the station has an address, so
+     * nothing in setup() has to wait for the network.
+     */
+    dlna_begin();
   }
 
   // The mode decides which audio path exists at all, and the screens say
@@ -1435,6 +1486,7 @@ void loop() {
   management_loop();
   df_player_loop();
   net_radio_loop();
+  dlna_loop();
   // After the sources have published their state, so an alarm that starts one
   // sees it running on the same pass rather than the next.
   alarm_loop();

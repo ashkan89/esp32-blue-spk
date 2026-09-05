@@ -1,0 +1,79 @@
+# esp32-blue-spk -- 16 MB partition layout, shared by both build targets.
+#
+# WHY THIS FILE EXISTS
+#
+# This is byte-for-byte the framework's own default_16MB.csv. It is copied into
+# the repository rather than referenced by name for two reasons:
+#
+#   1. a platform update is free to change what default_16MB.csv contains, and
+#      a partition table that changes under a fleet of flashed devices is the
+#      one build input where that is unrecoverable -- move the NVS offset and
+#      every stored setting on every unit is gone;
+#   2. it can be reviewed. The offsets below are the contract between the
+#      firmware and every device already in the field, and they belong where a
+#      diff will show them.
+#
+# Because the geometry is unchanged, there is NO MIGRATION. A device running the
+# previous firmware can take this build over OTA and keep its settings, its
+# Wi-Fi credentials, its stations, its alarms and its Bluetooth bonds. That was
+# the deciding constraint; every other consideration below was weighed against
+# it and lost.
+#
+# MEASURED FIT (2026-09-05, esp32dev baseline, Arduino core 3.3.11 / IDF 5.5.5)
+#
+#   application image        2,853,664 bytes
+#   app0 / app1 slot size    6,553,600 bytes
+#   occupancy                43.5%, leaving 3.7 MB of growth in each slot
+#
+# Roughly 2.3 MB of that image is src/voice_clips.h -- the pre-rendered speech
+# used for the spoken announcements -- so the code itself is around half a
+# megabyte. That is worth knowing before reading the headroom as room for
+# features: adding phrases costs far more than adding code.
+#
+# WHAT WAS CONSIDERED AND NOT DONE
+#
+#   growing nvs from 20 KB   The new record types (queue, media catalogs, feed
+#                            subscriptions, bookmarks, the event log) would fit
+#                            far more comfortably in a larger NVS. Growing it
+#                            in place is safe for existing data -- NVS is
+#                            page-based and pages added at the end are ignored
+#                            by older firmware -- but it moves otadata, and
+#                            otadata is where the bootloader looks to decide
+#                            which slot to boot. Getting that wrong bricks a
+#                            unit into needing a cable.
+#
+#                            So the bulk records go to the spiffs partition
+#                            below instead, which is 3.375 MB and, as of this
+#                            build, entirely unused. NVS keeps what it holds
+#                            today: small preferences and credentials. This is
+#                            also the better design on its own merits -- NVS is
+#                            a key/value store with a rewrite cost per commit,
+#                            and a growing queue is neither small nor rarely
+#                            written.
+#
+#   shrinking the app slots  6.25 MB each for a 2.85 MB image is generous. It is
+#                            also the layout that is deployed, and reclaiming
+#                            2 MB of flash that nothing is waiting for is not
+#                            worth a migration that can lose settings.
+#
+# BOUNDS CHECK (every partition, in order, must tile 0x9000..0x1000000 exactly)
+#
+#   nvs        0x009000 + 0x005000 = 0x00E000  ok, meets otadata
+#   otadata    0x00E000 + 0x002000 = 0x010000  ok, meets app0
+#   app0       0x010000 + 0x640000 = 0x650000  ok, meets app1     (64 KB aligned)
+#   app1       0x650000 + 0x640000 = 0xC90000  ok, meets spiffs   (64 KB aligned)
+#   spiffs     0xC90000 + 0x360000 = 0xFF0000  ok, meets coredump
+#   coredump   0xFF0000 + 0x010000 = 0x1000000 ok, exactly 16 MB
+#
+# App partitions must start on a 64 KB boundary on this chip because the flash
+# MMU maps them in 64 KB pages; both do. Nothing overlaps and nothing is
+# stranded. scripts/test_partitions.py asserts all of the above from this file,
+# so a future edit that breaks it is a test failure rather than a bad flash.
+#
+# Name,   Type, SubType, Offset,  Size,     Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x640000,
+app1,     app,  ota_1,   0x650000,0x640000,
+spiffs,   data, spiffs,  0xc90000,0x360000,
+coredump, data, coredump,0xFF0000,0x10000,

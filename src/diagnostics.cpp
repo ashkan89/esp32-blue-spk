@@ -19,6 +19,8 @@
 #include "audio_probe.h"
 #include "battery.h"
 #include "df_player.h"
+#include "dlna.h"
+#include "board_caps.h"
 #include "hw_config.h"
 #include "leds.h"
 #include "management.h"
@@ -108,6 +110,22 @@ void print_report() {
                    "==============="));
   LOGF("firmware      %s v%s, built %s %s\n", APP_NAME, FW_VERSION,
                 __DATE__, __TIME__);
+  /*
+   * Which of the two targets this image is, and what it was compiled to be able
+   * to do.
+   *
+   * First question of any support conversation, and the one nobody can answer
+   * from looking at the board: a WROOM build and a WROVER build are the same
+   * firmware, the same version number and the same dashboard, and they differ
+   * in which features exist at all. Printed before anything else so a pasted
+   * diagnostic is self-identifying.
+   */
+  LOGF("target        %s (%s)\n", BOARD_ENV_NAME, BOARD_MODULE_NAME);
+  LOGF("compiled with radio %s, dlna %s, ble-control %s\n",
+                CAP_NET_RADIO ? "yes" : "no", CAP_DLNA ? "yes" : "no",
+                CAP_BLE_CTRL ? "yes" : "no");
+  if (board_caps().degraded)
+    LOGF("DEGRADED      %s\n", board_caps().degraded_reason);
 
   esp_chip_info_t chip;
   esp_chip_info(&chip);
@@ -187,9 +205,40 @@ void print_report() {
                                                            MALLOC_CAP_8BIT));
   LOGF("  DMA-capable %6u bytes free  (I2S descriptors live here)\n",
                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA));
-  // No PSRAM on a WROOM-32D, and saying so is worth one line: every third
-  // ESP32 answer on the internet assumes there is some.
-  LOGLN(F("  psram       none (WROOM-32D has no external SPI RAM)"));
+  /*
+   * External RAM: fitted, mapped, and free, as three different numbers.
+   *
+   * This used to be one hardcoded line saying a WROOM-32D has none, which was
+   * true of the only board there was. Now it is a measurement, and the
+   * measurement has a gap in it that looks like a fault and is not: an N16R8
+   * reports eight megabytes fitted and a little under four usable, because a
+   * classic ESP32 reaches external RAM through a 4 MiB window in the data bus
+   * and the framework reserves eight banks of that window for the himem API
+   * besides. Anybody reading this line deserves to be told that rather than
+   * left to wonder where half their PSRAM went.
+   */
+  {
+    const BoardCaps &b = board_caps();
+    if (b.psram_ok) {
+      LOGF("  psram       %6u KB fitted, %u KB mapped into the heap\n",
+                    (unsigned)(b.psram_physical_bytes / 1024u),
+                    (unsigned)(b.psram_mapped_bytes / 1024u));
+      LOGF("              %6u KB free now, %u KB largest block\n",
+                    (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024u),
+                    (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) /
+                               1024u));
+      if (b.psram_physical_bytes > b.psram_mapped_bytes + (256u * 1024u))
+        LOGF("              the %u MB above the window needs the banked himem "
+                      "API and is not malloc memory\n",
+                      (unsigned)((b.psram_physical_bytes - b.psram_mapped_bytes) /
+                                 (1024u * 1024u)));
+    } else {
+      LOGF("  psram       none%s\n",
+                    BOARD_EXPECTS_PSRAM
+                        ? "  <-- this build expects it; see DEGRADED above"
+                        : " (this target has no external SPI RAM)");
+    }
+  }
 
   LOGLN(F("--- task stacks (smallest free ever) ----------------------"
                    "---------------"));
@@ -251,6 +300,22 @@ void print_report() {
                   df.pcLink ? " pc" : "");
     if (df.error[0]) LOGF("              last error: %s\n", df.error);
   }
+#if CAP_DLNA
+  {
+    DlnaStatus d;
+    dlna_snapshot(&d);
+    LOGF("  DLNA        %s, %s on port %u\n",
+                  d.enabled ? "enabled" : "disabled",
+                  d.running ? "discoverable" : "not running", (unsigned)d.port);
+    if (d.running) {
+      LOGF("              %u subscription(s), %u action(s) served\n",
+                    (unsigned)d.subscriptions, (unsigned)d.requests);
+      if (d.controller[0])
+        LOGF("              last controller: %s\n", d.controller);
+      if (d.uri[0]) LOGF("              uri: %.60s\n", d.uri);
+    }
+  }
+#endif
   LOGF("  I2C errors  %u (DS3231 transactions that did not complete)\n",
                 (unsigned)soft_clock_i2c_errors());
 

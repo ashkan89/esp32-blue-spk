@@ -1,6 +1,21 @@
 #include "app_config.h"
 #include "net_radio.h"
 
+/*
+ * The whole of this file is a WROVER capability.
+ *
+ * net_radio.h supplies inline stubs when CAP_NET_RADIO is 0, so nothing that
+ * calls into here needs to know. The guard is here rather than in the build
+ * system so that the decoders come with it: libhelix is referenced only from
+ * this translation unit, and with the unit empty the linker drops the MP3 and
+ * AAC decoders, the HTTP stream reader and the TLS client along with it. That
+ * is about forty kilobytes of flash and, more to the point, every code path
+ * that could have opened a socket to a station.
+ *
+ * -DWROOM_ALLOW_RADIO=1 compiles it back in for a WROOM, unchanged.
+ */
+#if CAP_NET_RADIO
+
 #include <Arduino.h>
 #include <NetworkClientSecure.h>
 #include <new>
@@ -13,6 +28,7 @@
 #include "AudioTools/AudioCodecs/CodecMP3Helix.h"
 #include "AudioTools/Communication/AudioHttp.h"
 
+#include "board_caps.h"
 #include "audio_eq.h"
 #include "audio_probe.h"
 #include "management.h"
@@ -39,13 +55,46 @@ namespace {
  * allocation made early sits in the middle of the heap splitting exactly the
  * block the handshake needs. Idle radio now costs nothing at all.
  */
-const size_t RING_BYTES = 20 * 1024;
+const size_t RING_BYTES_MIN = 20 * 1024;
 
-/// How full the ring has to be before decoding starts, as a percentage. Filling
-/// it completely would make every station take twice as long to start for no
-/// benefit; below about half, the first underrun arrives before the buffer has
-/// found its level.
+/*
+ * What the ring is allowed to grow to when there is external RAM to put it in.
+ *
+ * 256 kB is about sixteen seconds of a 128 kbps stream. That is not chosen to
+ * be impressive, it is chosen because it is the point past which a domestic
+ * connection's problems stop being pauses and start being outages -- and an
+ * outage is better reported than buffered through.
+ *
+ * The WROOM never sees this. board_buffer_budget() clamps to what is actually
+ * allocatable, and with no PSRAM that is the internal heap minus its reserve,
+ * which lands back at RING_BYTES_MIN.
+ */
+const size_t RING_BYTES_PSRAM = 256 * 1024;
+
+/// The ring this stream got. Decided in arenaAcquire() from what the board can
+/// actually spare, and constant for the life of the arena.
+size_t ringBytes = RING_BYTES_MIN;
+
+/*
+ * How full the ring has to be before decoding starts.
+ *
+ * A percentage alone was right when the ring was always 20 kB and became wrong
+ * the moment it could be 256 kB: 55% of the larger ring is nine seconds of
+ * silence after every station change, which is not resilience, it is a fault
+ * report. So the prebuffer is the smaller of the percentage and a fixed byte
+ * count -- the ring gets big for resilience, the wait stays short.
+ *
+ * 11 kB is about seven tenths of a second at 128 kbps, which is what the 20 kB
+ * ring's 55% always was. Startup feel is unchanged on both boards; only the
+ * depth behind it grows.
+ */
 const uint8_t PREBUFFER_PERCENT = 55;
+const size_t PREBUFFER_MAX_BYTES = 11 * 1024;
+
+size_t prebufferBytes() {
+  const size_t pct = ringBytes * PREBUFFER_PERCENT / 100;
+  return pct < PREBUFFER_MAX_BYTES ? pct : PREBUFFER_MAX_BYTES;
+}
 
 /// How much is read from the socket in one go: two MTUs. Larger reads made no
 /// measurable difference to the buffer level and every byte of this is resident
@@ -181,11 +230,14 @@ I2SStream *i2s;
  * malloc, one free, and no chance of leaving the heap with three
  * differently-sized holes in it after every station change.
  */
-const size_t STREAM_ARENA = RING_BYTES + READ_CHUNK + DECODE_CHUNK;
+size_t arenaBytes = RING_BYTES_MIN + READ_CHUNK + DECODE_CHUNK;
 uint8_t *arena;
+/// True when the arena came out of external RAM, which changes what the
+/// admission check below has to ask of the internal heap.
+bool arenaInPsram;
 uint8_t *ring;    // arena
-uint8_t *chunk;   // arena + RING_BYTES
-uint8_t *feed;    // arena + RING_BYTES + READ_CHUNK
+uint8_t *chunk;   // arena + ringBytes
+uint8_t *feed;    // arena + ringBytes + READ_CHUNK
 size_t ringHead, ringTail, ringUsed;
 
 /// The favourites. On the heap and not in .bss because 2.4 kB of DRAM that only
@@ -196,17 +248,49 @@ uint8_t stationCount;
 
 bool arenaAcquire() {
   if (arena) return true;
-  arena = (uint8_t *)malloc(STREAM_ARENA);
-  if (!arena) return false;
+
+  /*
+   * Ask the board how big this is allowed to be, rather than deciding here.
+   *
+   * On a WROOM the answer is the internal heap minus its reserve, which lands
+   * at the 20 kB this has always used. On a WROVER it is external RAM, and the
+   * ring can be an order of magnitude deeper for free -- which is the entire
+   * point of fitting the part, and was being wasted while this function called
+   * plain malloc() and a fixed constant.
+   */
+  const size_t fixed = READ_CHUNK + DECODE_CHUNK;
+  const size_t budget = board_buffer_budget(RING_BYTES_PSRAM + fixed,
+                                            RING_BYTES_MIN + fixed);
+  if (!budget) return false;
+
+  arena = (uint8_t *)board_alloc(budget, /*allow_internal=*/true);
+  if (!arena) {
+    // The budget said it would fit and the allocator disagreed, which means
+    // something took the block in between. Fall back to the floor rather than
+    // failing the stream: a small ring plays, and no ring does not.
+    arenaBytes = RING_BYTES_MIN + fixed;
+    arena = (uint8_t *)board_alloc(arenaBytes, /*allow_internal=*/true);
+    if (!arena) return false;
+  } else {
+    arenaBytes = budget;
+  }
+
+  arenaInPsram = board_ptr_in_psram(arena);
+  ringBytes = arenaBytes - fixed;
   ring = arena;
-  chunk = arena + RING_BYTES;
+  chunk = arena + ringBytes;
   feed = chunk + READ_CHUNK;
+  LOGF("[radio] arena %u kB in %s, ring %u kB (~%u s at 128 kbps)\n",
+       (unsigned)(arenaBytes / 1024), arenaInPsram ? "PSRAM" : "internal RAM",
+       (unsigned)(ringBytes / 1024), (unsigned)(ringBytes / 16000));
   return true;
 }
 
 void arenaRelease() {
-  free(arena);
+  board_free(arena);
   arena = nullptr;
+  arenaInPsram = false;
+  ringBytes = RING_BYTES_MIN;
   ring = chunk = feed = nullptr;
 }
 
@@ -455,12 +539,12 @@ void ringClear() {
 
 size_t ringWrite(const uint8_t *data, size_t len) {
   size_t written = 0;
-  while (written < len && ringUsed < RING_BYTES) {
-    const size_t space = RING_BYTES - ringUsed;
+  while (written < len && ringUsed < ringBytes) {
+    const size_t space = ringBytes - ringUsed;
     size_t run = min(len - written, space);
-    run = min(run, RING_BYTES - ringHead);
+    run = min(run, ringBytes - ringHead);
     memcpy(ring + ringHead, data + written, run);
-    ringHead = (ringHead + run) % RING_BYTES;
+    ringHead = (ringHead + run) % ringBytes;
     ringUsed += run;
     written += run;
   }
@@ -471,9 +555,9 @@ size_t ringRead(uint8_t *out, size_t len) {
   size_t taken = 0;
   while (taken < len && ringUsed > 0) {
     size_t run = min(len - taken, ringUsed);
-    run = min(run, RING_BYTES - ringTail);
+    run = min(run, ringBytes - ringTail);
     memcpy(out + taken, ring + ringTail, run);
-    ringTail = (ringTail + run) % RING_BYTES;
+    ringTail = (ringTail + run) % ringBytes;
     ringUsed -= run;
     taken += run;
   }
@@ -590,17 +674,47 @@ void runStream(const char *url, bool *stopped) {
    * Refuse before allocating anything, rather than dying inside the HTTP
    * client. The message carries the actual numbers because "not enough memory"
    * on its own tells nobody what to do about it.
+   *
+   * The figures below are INTERNAL heap, and that distinction is the whole of
+   * this block's history. ESP.getFreeHeap() is
+   * heap_caps_get_free_size(MALLOC_CAP_INTERNAL) -- it does not count external
+   * RAM at all. So on a WROVER with four usable megabytes of PSRAM this check
+   * was reading ~150 kB, refusing the stream, and reporting "Low memory" at
+   * somebody looking at a board with 8 MB fitted. It was right about the
+   * number and wrong about the question.
+   *
+   * Internal heap is still the right thing to ask about, because what actually
+   * needs it cannot live anywhere else: the socket, the TLS session, and the
+   * decoder task's stack. What does NOT need it is the jitter buffer, which is
+   * most of STREAM_HEAP_FLOOR and which arenaAcquire() now puts in external RAM
+   * when there is any. So the requirement drops by exactly that much when the
+   * arena is going elsewhere.
    */
   const bool secure = urlIsSecure(url);
-  const uint32_t needed = STREAM_HEAP_FLOOR + (secure ? STREAM_TLS_EXTRA : 0);
-  const uint32_t heap = ESP.getFreeHeap();
-  const uint32_t block = ESP.getMaxAllocHeap();
-  if (heap < needed || block < STREAM_BLOCK_FLOOR) {
+  const bool arenaElsewhere = board_can(BOARD_CAP_PSRAM);
+  const uint32_t arenaInternal =
+      arenaElsewhere ? 0u : (uint32_t)(RING_BYTES_MIN + READ_CHUNK + DECODE_CHUNK);
+  const uint32_t floorNow =
+      STREAM_HEAP_FLOOR - (uint32_t)(RING_BYTES_MIN + READ_CHUNK + DECODE_CHUNK) +
+      arenaInternal;
+  const uint32_t needed = floorNow + (secure ? STREAM_TLS_EXTRA : 0);
+  const uint32_t heap = ESP.getFreeHeap();          // internal only
+  const uint32_t block = ESP.getMaxAllocHeap();     // internal only
+  // The block floor exists for the arena, so it only applies while the arena is
+  // coming out of the internal heap. A TLS context wants large pieces too, and
+  // STREAM_TLS_EXTRA above is what accounts for those.
+  const uint32_t blockFloor = arenaElsewhere ? 12000u : STREAM_BLOCK_FLOOR;
+  if (heap < needed || block < blockFloor) {
     char why[RADIO_TEXT_MAX];
-    if (secure && heap >= STREAM_HEAP_FLOOR) {
+    if (secure && heap >= floorNow) {
       // It would have fitted without the encryption, which makes the fix a
       // one-character edit to the address rather than a lost cause.
       snprintf(why, sizeof(why), "Not enough memory for https - try http://");
+    } else if (arenaElsewhere) {
+      // Say "internal", because the owner can see the PSRAM figure elsewhere on
+      // the same page and "low memory" next to "4 MB free" reads as a bug.
+      snprintf(why, sizeof(why), "Low internal RAM: %u free, %u block",
+               (unsigned)heap, (unsigned)block);
     } else {
       snprintf(why, sizeof(why), "Low memory: %u free, %u block", (unsigned)heap,
                (unsigned)block);
@@ -608,8 +722,8 @@ void runStream(const char *url, bool *stopped) {
     setState(RADIO_ERROR, why);
     LOGF("[radio] refusing to start a %s stream: %u B free, %u B largest block "
          "(needs %u / %u)\n", secure ? "https" : "http", (unsigned)heap,
-         (unsigned)block, (unsigned)needed, (unsigned)STREAM_BLOCK_FLOOR);
-    if (secure && heap >= STREAM_HEAP_FLOOR) {
+         (unsigned)block, (unsigned)needed, (unsigned)blockFloor);
+    if (secure && heap >= floorNow) {
       LOGLN("[radio] the same station over plain http would fit. TLS needs "
             "another ~45 kB for its record buffers, and this chip does not "
             "have it while the dashboard is up.");
@@ -724,7 +838,7 @@ void runStream(const char *url, bool *stopped) {
   setState(RADIO_BUFFERING);
   adoptMetadata();
 
-  const size_t prebuffer = RING_BYTES * PREBUFFER_PERCENT / 100;
+  const size_t prebuffer = prebufferBytes();
   bool decoding = false;
   uint32_t lastByteAt = millis();
   uint32_t lastPercentAt = 0;
@@ -738,7 +852,7 @@ void runStream(const char *url, bool *stopped) {
     }
 
     // Fill.
-    const size_t space = RING_BYTES - ringUsed;
+    const size_t space = ringBytes - ringUsed;
     if (space >= 512 && stream->available() > 0) {
       const size_t want = min(space, READ_CHUNK);
       const size_t got = stream->readBytes(chunk, want);
@@ -769,7 +883,7 @@ void runStream(const char *url, bool *stopped) {
     if (now - lastPercentAt >= 100) {
       lastPercentAt = now;
       statusLock();
-      status.bufferPercent = (uint8_t)(ringUsed * 100 / RING_BYTES);
+      status.bufferPercent = (uint8_t)(ringUsed * 100 / ringBytes);
       statusUnlock();
     }
 
@@ -976,7 +1090,7 @@ bool net_radio_begin(void *out) {
    */
   running = true;
   LOGF("[radio] ready, %u stations, %u kB buffer when playing\n",
-                (unsigned)stationCount, (unsigned)(STREAM_ARENA / 1024));
+                (unsigned)stationCount, (unsigned)(arenaBytes / 1024));
 
   /*
    * Did the last boot survive its own autostart?
@@ -1369,3 +1483,5 @@ bool net_radio_command(const char *line) {
                  "station stop|next|prev");
   return true;
 }
+
+#endif  // CAP_NET_RADIO
