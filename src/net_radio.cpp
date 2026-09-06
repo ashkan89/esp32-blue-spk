@@ -1,6 +1,8 @@
 #include "app_config.h"
 #include "net_radio.h"
 
+#include "heap_guard.h"
+
 /*
  * The whole of this file is a WROVER capability.
  *
@@ -249,6 +251,7 @@ RadioStation *stations;
 uint8_t stationCount;
 
 bool arenaAcquire() {
+  heap_guard_mark("radio: sizing the jitter buffer");
   if (arena) return true;
 
   /*
@@ -423,6 +426,7 @@ void loadStations() {
 }
 
 void storeStations() {
+  heap_guard_mark("radio: writing the station list");
   if (!prefs.isKey("vol") && stationCount == 0) return;
   prefs.putBytes("list", stations, sizeof(RadioStation) * stationCount);
   prefs.putUChar("count", stationCount);
@@ -794,6 +798,7 @@ void runStream(const char *url, bool *stopped) {
    * fetch, and the two things worth knowing at that point are the exact URL and
    * whether anything shortened it on the way in.
    */
+  heap_guard_mark("radio: opening the stream");
   LOGF("[radio] opening (%u chars): %s\n", (unsigned)strlen(url), url);
   const uint32_t startedAt = millis();
   const bool opened = stream->begin(url, "audio/mpeg");

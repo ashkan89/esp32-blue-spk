@@ -2,6 +2,8 @@
 #include "board_caps.h"
 #include "management.h"
 
+#include "heap_guard.h"
+
 #if MANAGEMENT_ENABLED
 
 #include <ArduinoJson.h>
@@ -4006,6 +4008,7 @@ void handleRadioGet() {
 }
 
 void handleRadioPost() {
+  heap_guard_mark("web: /api/radio POST");
   if (!requireAuth()) return;
   JsonDocument body;
   if (!readBody(body)) return;

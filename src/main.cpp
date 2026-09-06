@@ -69,6 +69,7 @@
 #include "alarm_clock.h"
 #include "audio_eq.h"
 #include "board_caps.h"
+#include "heap_guard.h"
 #include "audio_probe.h"
 #include "battery.h"
 #include "df_player.h"
@@ -1301,6 +1302,7 @@ void setup() {
    * question.
    */
   board_caps_begin();
+  heap_guard_begin();
 
   status_led_begin(PIN_STATUS_LED, STATUS_LED_ACTIVE_HIGH);
 
@@ -1312,13 +1314,17 @@ void setup() {
    * pushing that much text out of a 115200 baud UART stalls the I2S writer long
    * enough to underrun.
    *
-   * Info is for one job -- finding out where an HTTP stream setup dies inside
-   * the library, which its own log narrates step by step and ours cannot see.
-   * Build with -DAUDIOTOOLS_LOG_INFO=1 to turn it on, reproduce, and turn it
-   * off again. It is deliberately not a runtime setting: it is a debugging
-   * tool, not a preference.
+   * Info and Debug exist for one job -- finding out where an HTTP stream setup
+   * dies inside the library, which its own log narrates step by step and ours
+   * cannot see from outside. Debug additionally names every header line as it
+   * is added, which is what identifies a bad entry in the request header.
+   *
+   * Build with -DAUDIOTOOLS_LOG=1 or =2, reproduce, and take it out again.
+   * See the note in app_config.h.
    */
-#if AUDIOTOOLS_LOG_INFO
+#if AUDIOTOOLS_LOG >= 2
+  AudioLogger::instance().begin(Serial, AudioLogger::Debug);
+#elif AUDIOTOOLS_LOG == 1
   AudioLogger::instance().begin(Serial, AudioLogger::Info);
 #else
   AudioLogger::instance().begin(Serial, AudioLogger::Warning);

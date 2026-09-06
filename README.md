@@ -2929,6 +2929,366 @@ arrive within 3 s is dropped, a body over 4 kB is refused, and at most one
 `NOTIFY` is sent per loop pass so a controller that walked away cannot stall
 anything with a connect timeout.
 
+### Open: a LoadProhibited panic when a controller presses Play
+
+**Status: unresolved.** On the WROVER, pushing a track from a UPnP controller
+reaches the point of opening the stream and then panics inside the HTTP client:
+
+```
+[radio] opening (82 chars): http://192.168.68.72:10246/MDEServer/3C16.../1000.mp3
+Guru Meditation Error: Core 1 panic'ed (LoadProhibited)
+EXCVADDR: 0x00000060
+
+radioTask → ICYStream::begin → URLStream::begin → HttpRequest::process
+  → processBegin → HttpHeader::write → writeHeaderLine   ← faults
+```
+
+`HttpHeader::write()` iterates its list of header lines and does
+`writeHeaderLine(out, *line_ptr)`. `HttpHeaderLine` is `Str key; Str value;
+bool active;` — `active` sits at offset **0x60**, which is exactly the faulting
+address. So one entry in that list is a null pointer, and the fault is the read
+of `header.active` through it.
+
+The crash is in `arduino-audio-tools`, not in this firmware. What this firmware
+can be wrong about is how it asks.
+
+#### What has been ruled out
+
+Worth writing down, because each one cost a reproduction:
+
+- **URL truncation.** The first suspicion, and wrong. `DLNA_URI_MAX` was 300
+  while `RADIO_URL_MAX` was 160, so a pushed URL really was being silently
+  shortened into a request for a different resource — a genuine defect, now
+  fixed with a separate `RADIO_PLAY_URL_MAX` and an outright refusal instead of
+  a truncation. But the diagnostic added at the same time settled it: the URL
+  that crashes is **82 characters**, complete and well formed.
+- **Heap exhaustion.** 115 kB internal free and 4 MB of PSRAM at the moment of
+  the fault. A `HttpHeaderLine` is about 100 bytes.
+- **`HttpHeader::put()` failing to add a line.** It handles that case and logs
+  `LOGE` when it happens. `AudioLogger` is at Warning, which prints errors, and
+  nothing was printed.
+- **The `List` iterator over-running into its sentinel.** `begin()` is
+  `first.next`, `end()` is `&last`, and the range-for stops before
+  dereferencing `last`. Bounds are correct.
+- **A redirect.** `URLStream::process()` has a genuine use-after-free on the
+  redirect path (it caches a pointer into a header value across a
+  `request.process()` that can free it), but the backtrace faults in the
+  **first** `process()` call, before any redirect is considered.
+- **The PSRAM cache erratum.** The board reports `ESP32-D0WD-V3 revision 3.1`,
+  where it is fixed, and `board_caps_begin()` checks this at boot.
+
+#### What is still open, and the test that would narrow it
+
+The leading theory is now that this is **not DLNA-specific** — it is the radio
+path on the WROVER build, and a DLNA push is simply the first thing that has
+exercised it on that board. Two observations point that way: the URL is
+structurally identical to a station URL, and everything in the failing stack is
+below `net_radio.cpp`.
+
+The test that distinguishes them is one click: **play a saved station from the
+dashboard's Radio page.** If that panics identically, DLNA is a bystander and
+the fault is in the radio's use of `URLStream` on a PSRAM build. If stations
+play, the difference is in the URL or the flow and the search narrows to those.
+
+#### It cannot be the URL, and it cannot be the server
+
+Worth stating separately, because it redirects the whole search.
+
+`HttpRequest::processBegin()` opens the TCP connection **before** it writes the
+header. The backtrace faults in `write()`, after the connect returned. So the
+server has been reached and has sent nothing yet — its identity, its response,
+its content type cannot be involved.
+
+And the code that composes a request is identical for a saved station and a
+pushed file: both arrive at the same `runStream()` with nothing different but
+the characters in the URL, and the header list does not depend on those.
+
+**So a saved station should crash in exactly the same place.** If it does not,
+this reasoning is wrong and that is worth knowing too — which makes playing a
+station from the dashboard the single most informative thing to try.
+
+#### The leading theory: the library's collections in external RAM
+
+What *is* different between the two builds on this path is where AudioTools
+puts its own memory.
+
+`DefaultAllocator` is an `AllocatorExt`, and its `do_allocate()` calls
+`ps_malloc()` first, falling back to `malloc()` only when that returns null:
+
+```cpp
+#if defined(USE_PSRAM) && defined(ARDUINO)
+    result = ps_malloc(size);
+#endif
+    if (result == nullptr) result = malloc(size);
+```
+
+Every `Vector` and every `List` in the library goes through it — including the
+`List<HttpHeaderLine*>` that faults. On a WROOM `ps_malloc()` always returns
+null, so all of it has lived in internal RAM for the life of this project. On a
+WROVER it succeeds, and those collections moved to external RAM the moment the
+part was fitted.
+
+That is the only difference on this code path, and upstream discussion reports
+URLStream instability on PSRAM boards with the same shape of workaround: force
+those allocations back to internal RAM.
+
+[src/audiotools_ram.cpp](src/audiotools_ram.cpp) does that, by wrapping
+`ps_malloc` and `ps_calloc` at link time so they answer what a board with no
+PSRAM answers. No library source is patched. **No external RAM this firmware
+wanted is given up** — the jitter buffer (up to 512 kB) and the renderer's
+scratch go through `board_alloc()`, which calls
+`heap_caps_malloc(MALLOC_CAP_SPIRAM)` directly and is untouched. Only the
+libraries' own small collections move, and they fit in internal RAM because
+they always have.
+
+It is a theory, and it is built to be falsified in one rebuild:
+
+```ini
+build_flags = ... -DAUDIOTOOLS_PSRAM=1
+```
+
+puts the libraries back in external RAM. If the panic follows the flag, that
+file is the explanation. If it does not, the file is wrong and should be
+deleted rather than left standing as a superstition.
+
+#### The station test came back, and it settles the question
+
+A saved station — no controller, no DLNA, nothing pushed — panics too. So the
+reasoning above holds: this is not DLNA-specific, and it cannot be the URL or
+the server.
+
+It came back with a different crash, though, and the difference is the most
+informative thing that has happened so far:
+
+```
+***ERROR*** A stack overflow in task loopTask has been detected.
+```
+
+#### That message does not mean what it says
+
+`CONFIG_FREERTOS_CHECK_STACKOVERFLOW_CANARY=y` in this build. The canary method
+does not measure how deep a task went. It writes a byte pattern at the low end
+of the task's stack and checks, at every context switch, that the pattern is
+still there. "A stack overflow in loopTask" therefore means exactly one thing:
+**those bytes changed.** Whether the loop task grew down into them, or
+something else in the system wrote over them, produces the identical message.
+
+The loop task did not grow into them, and this is measured rather than
+believed. The compiler was asked:
+
+```
+PLATFORMIO_BUILD_FLAGS="-fstack-usage" pio run -e esp32_wrover_e_n16r8
+```
+
+which makes GCC emit a `.su` file per translation unit giving the exact frame
+size of every function. Sorted across all of them, the deepest single frame
+anywhere in this firmware is **1,504 bytes**, in a task that has **12,288**.
+The deepest call chain reachable from `loop()` is about 3 kB. There is no
+combination of these frames that reaches the canary.
+
+> An earlier pass at this claimed `handleAlarmsPost()` had an 8,440-byte frame
+> and was the culprit. That number was wrong. It came from parsing
+> `objdump -d` output, and objdump decoded only 338,230 of the 642,036 lines it
+> printed for this image — the rest came out as raw words with no mnemonic, so
+> the parser attributed a later function's `entry` instruction to whatever
+> function it had last seen a header for. Per the compiler, no function in
+> `management.cpp` exceeds the 1,504-byte maximum quoted above.
+> `-fstack-usage` is the tool for this question; disassembly is not.
+
+#### So both panics are one bug, and it is memory corruption
+
+Put the two crashes side by side:
+
+* a **null pointer** in a `List<HttpHeaderLine*>` that the library never puts a
+  null into — `new HttpHeaderLine(key)` is pushed unconditionally;
+* the **canary at the bottom of loopTask's stack** overwritten, with no frame
+  in the firmware deep enough to have done it.
+
+Neither is explicable on its own. Both are ordinary consequences of one stray
+write, differing only in what the write happened to land on. And loopTask's
+stack is itself a heap block — `xTaskCreateUniversal()` allocates it — so a
+write running off the end of the block in front of it lands precisely on that
+canary.
+
+That reframes every earlier theory on this page as a guess about *which* write,
+without evidence about *whether* there is one.
+
+#### It can be caught rather than guessed at
+
+The build already has what is needed:
+
+```
+CONFIG_HEAP_POISONING_LIGHT=y
+```
+
+Every heap block carries a head and a tail canary, and
+`heap_caps_check_integrity_all()` walks all of them and names the block whose
+canary is wrong. No sdkconfig change, no rebuilt core.
+
+[src/heap_guard.cpp](src/heap_guard.cpp) runs that check on its own task every
+200 ms, and [src/heap_guard.h](src/heap_guard.h) carries the reasoning. When it
+fires it prints the block the IDF names, the state of both heaps, and a label
+saying what the firmware was doing — the marks are placed on the paths under
+suspicion:
+
+| mark | where |
+| --- | --- |
+| `radio: sizing the jitter buffer` | `arenaAcquire()` |
+| `radio: opening the stream` | `runStream()`, at the point the URL is logged |
+| `radio: writing the station list` | `storeStations()` |
+| `dlna: starting playback` | `startPlayback()` |
+| `dlna: serving a control request` | `serviceHttp()` |
+| `web: /api/radio POST` | `handleRadioPost()` |
+
+It also samples loopTask's headroom, and that number is the discriminator. If
+it falls steadily toward zero, the stack really is being consumed and the
+measurement above is wrong somewhere. If it sits high and the canary breaks
+anyway, corruption is proven rather than argued. A reported headroom of
+**zero** is the corruption case specifically: `uxTaskGetStackHighWaterMark()`
+counts up from the low end for as long as it sees the fill pattern, so zero
+means the first byte it looked at was already something else — which is not
+what running out of stack looks like, because running out is gradual and the
+falling numbers would have been printed first.
+
+It is on by default while the board is failing, and compiles to nothing —
+task never created, mark strings never linked — with:
+
+```ini
+build_flags = ... -DHEAP_GUARD=0
+```
+
+#### A third face, and it confirms the diagnosis
+
+Casting produced a different abort again:
+
+```
+assert failed: tcp_input /IDF/components/lwip/lwip/src/core/tcp_in.c:298
+               (tcp_input: TIME-WAIT pcb->state == TIME-WAIT)
+```
+
+`tcp_input()` walks the TIME-WAIT list and asserts that every PCB on it is
+actually in the `TIME_WAIT` state. So a PCB on that list held some other value.
+
+The reason this matters more than the previous two put together is one line in
+the IDF's own `lwipopts.h`:
+
+```c
+#define MEMP_MEM_MALLOC                 1
+```
+
+lwIP on ESP-IDF does not use static pools. **Every PCB is a heap block.** Which
+puts all three crashes in one column:
+
+| crash | what held a value nobody wrote | where it lives |
+| --- | --- | --- |
+| `LoadProhibited`, EXCVADDR `0x60` | a node in `List<HttpHeaderLine*>` | heap block |
+| "stack overflow in loopTask" | the canary at the base of the stack | heap block |
+| `tcp_input: TIME-WAIT pcb->state` | `pcb->state` | heap block |
+
+Three unrelated-looking aborts, one event, seen wherever the damage happened to
+land. Nothing about the radio, the renderer, the URL or the server is common to
+all three; being a heap block in internal RAM is.
+
+#### Overrun or use-after-free — and the guard tells them apart
+
+This is the distinction that decides where to look next, and it is decided by
+whether the heap guard says anything before the crash:
+
+* **it reports corruption** — a write ran off the end of a block. The canary of
+  the block *after* it is wrong, and the guard names that block.
+* **it stays silent and a PCB is still wrong** — a **use-after-free**. A write
+  through a pointer to a block that has since been freed and handed to a new
+  owner leaves every canary intact, because the block is legitimately allocated
+  to that new owner. Nothing is out of bounds. Only the contents are wrong.
+
+The second is not detectable by an integrity walk, which is worth stating
+plainly rather than leaving as a gap in the instrument.
+
+#### What was checked and came back clean
+
+Worth recording, because each of these was a plausible cause and is now not one:
+
+* **The NVS blob loads.** `alarm_begin()` and the station list both read a
+  stored length into a fixed array — the classic unbounded-write shape. Both
+  guard with `have > 0 && have <= sizeof(...)` and then clamp the count to what
+  the blob actually contains. The `loadBlob` template requires an exact size
+  match. Bounded, all three.
+* **The renderer's lifecycle.** `dlna_stop()` frees the scratch and the server
+  and nulls both pointers; `dlna_loop()` refuses to do anything unless
+  `running`. No dangling `http` or `scr`.
+* **The renderer's scratch.** The fields of `Scratch` are separate arrays, not
+  a union, so there is no aliasing hazard between the SOAP body, the SSDP
+  reply and the outgoing XML.
+* **The `ps_malloc` wrap.** Both `DefaultAllocator`s in the audio libraries
+  resolve to `AllocatorExt`, which falls back to `malloc()` on a null. The wrap
+  cannot be introducing a null dereference. (`AllocatorPSRAM` would spin
+  forever instead — nothing uses it.)
+
+#### The assertion, made survivable
+
+[src/heap_guard.cpp](src/heap_guard.cpp) now runs lwIP's own invariant every
+200 ms, before `tcp_input()` gets to run it. When a TIME-WAIT PCB has the wrong
+state it prints the PCB's address and what the firmware was doing, and the
+board keeps running — a printed line with context instead of an abort with
+none. It also refuses to walk a list past 64 entries, because a `next` chain
+that does not end is itself the corruption and is not something to follow.
+
+It reads `tcp_active_pcbs` / `tcp_tw_pcbs` / `tcp_bound_pcbs` from
+`lwip/priv/tcp_priv.h` under `LOCK_TCPIP_CORE()`. The lock is not optional:
+`CONFIG_LWIP_CHECK_THREAD_SAFETY=y` here, so touching those lists without it
+would trip a different assertion of lwIP's own.
+
+#### A separate defect the same numbers exposed
+
+Two settings in this build, together:
+
+```
+CONFIG_LWIP_MAX_ACTIVE_TCP=16
+CONFIG_LWIP_TCP_MSL=60000
+```
+
+Sixteen TCP PCBs, and TIME-WAIT lasts `2 * TCP_MSL` — two minutes. Whichever
+end closes a connection *actively* holds a slot for that whole time, and this
+firmware is the active closer far more often than it looks:
+
+* the renderer answers every control request with `Connection: close` and then
+  calls `client.stop()`;
+* every GENA event notification opens a fresh outbound connection and closes
+  it;
+* the dashboard polls on top of both.
+
+A handful of casts and a minute of an open dashboard can therefore pin all
+sixteen slots, after which new connections fail and lwIP is permanently
+recycling TIME-WAIT entries. That is a real defect independent of the
+corruption, and the guard now prints the count whenever it comes within two of
+the ceiling, so it stops being a suspicion and becomes a number.
+
+#### One earlier change, on a weaker suspicion
+
+One earlier change has been made on the suspicion that the *order* of header
+manipulation matters. This firmware used to call
+`addRequestHeader("User-Agent", ...)` on the stream **before** `begin()`, which
+mutates the header line list before the library has set the client up. It now
+uses `httpRequest().setAgent()`, the accessor the library provides for exactly
+this, which stores a pointer and lets the library add the line inside its own
+sequence. Same header on the wire, no out-of-order mutation of the list that
+the fault occurs in. Whether that is the cause is not yet known.
+
+#### Getting the library to say where it dies
+
+```ini
+build_flags = ... -DAUDIOTOOLS_LOG=2
+```
+
+raises `AudioLogger` from Warning to Debug, and AudioTools then narrates its own
+HTTP setup — connecting, free heap, **every header line as it is added**, the
+reply. (`=1` is Info, which stops short of the per-line detail.) At Debug the
+last lines before the fault name the header line the library was holding when
+it dereferenced a null, which is the missing fact. Off by default because this
+library also logs from inside the decode path, and that much text at 115200
+baud stalls the I2S writer into an underrun; switch it on to reproduce, then
+off again.
+
 ### Checking it
 
 ```

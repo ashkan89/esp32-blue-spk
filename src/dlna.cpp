@@ -29,6 +29,8 @@
 
 #include "dlna.h"
 
+#include "heap_guard.h"
+
 #if CAP_DLNA
 
 #include <Arduino.h>
@@ -428,6 +430,7 @@ const char *transportName(DlnaTransport t) {
  * the console already follow.
  */
 bool startPlayback() {
+  heap_guard_mark("dlna: starting playback");
   if (!uriAcceptable(currentUri)) return false;
   if (!net_radio_running()) return false;
   if (df_player_running() && df_player_active()) {
@@ -1243,6 +1246,7 @@ const char *soapActionName(const char *header) {
 }
 
 void serviceHttp() {
+  heap_guard_mark("dlna: serving a control request");
   NetworkClient client = http->accept();
   if (!client) return;
   client.setTimeout(1);  // seconds, on this class -- see the note above

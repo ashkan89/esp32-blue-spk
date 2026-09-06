@@ -64,19 +64,29 @@
 #endif
 
 /*
- * AudioTools' own logging, at Info instead of Warning.
+ * How loud AudioTools is about its own internals.
  *
- * Off by default: the library logs from inside the decode path, and that much
- * text at 115200 baud stalls the I2S writer into an underrun. Switch it on for
- * one specific job -- finding where an HTTP stream setup fails inside the
- * library, which narrates each step (connect, header write, reply) in a way
- * this firmware's own logging cannot see from outside.
+ *   0  Warning  the default. The library logs from inside the decode path, and
+ *               that much text at 115200 baud stalls the I2S writer into an
+ *               underrun -- the same reason platformio.ini keeps
+ *               CORE_DEBUG_LEVEL at 1.
+ *   1  Info     each HTTP step: connecting, free heap, the header being
+ *               written, the reply status.
+ *   2  Debug    everything Info has, plus every individual header line as it
+ *               is put into the request -- which is the one that matters when
+ *               the question is "which header line was the library holding
+ *               when it dereferenced a null".
  *
- *     pio run -e esp32_wrover_e_n16r8 -t upload
- *         with build_flags += -DAUDIOTOOLS_LOG_INFO=1
+ * For diagnosing a stream that dies inside the library, build with
+ *
+ *     build_flags = ... -DAUDIOTOOLS_LOG=2
+ *
+ * reproduce once, and take it back out. It is deliberately a build flag rather
+ * than a runtime setting: it is a debugging instrument, not a preference, and
+ * leaving it on costs audio.
  */
-#ifndef AUDIOTOOLS_LOG_INFO
-#define AUDIOTOOLS_LOG_INFO 0
+#ifndef AUDIOTOOLS_LOG
+#define AUDIOTOOLS_LOG 0
 #endif
 
 /// True when anything at all wants the UART, which is what decides whether
