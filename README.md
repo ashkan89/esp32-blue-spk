@@ -3012,6 +3012,62 @@ say battery_low        play one
 say off                switch announcements off
 ```
 
+### Forms the poll must not touch
+
+The dashboard refreshes itself every two seconds, and the page you are looking
+at is refreshed with it. That is right for a countdown and wrong for a field
+somebody is typing in, and for a while the alarm editor was on the wrong side of
+that line:
+
+> Set the time to 09:30, and two seconds later it is 07:00 again.
+
+Two separate faults, and both had to be fixed:
+
+1. **The time and label inputs never fed the draft.** They were read only when
+   **Save** was pressed. So any repaint in between restored the value the draft
+   still held. That was true before polling entered into it — typing a time and
+   then clicking **Weekdays** discarded the time, because the day buttons
+   repaint the editor.
+
+2. **The poll repainted the open editor.** `renderAlarms()` ended by painting
+   the editor from the draft on every refresh. Fixing (1) alone would have made
+   it restore the *right* value, which is still wrong: writing into a field
+   somebody is typing in closes a native time picker, moves the caret, and on a
+   phone dismisses the keyboard.
+
+The rule now is **ownership**, and it is applied everywhere the same shape
+appears:
+
+| Region | Owner | Refreshes |
+|---|---|---|
+| Alarm list, countdown, ringing state | the speaker | every 2 s |
+| Alarm editor, once opened | whoever opened it | only on open, and from its own controls |
+| Broker connection status | the speaker | every 10 s |
+| Broker form fields | whoever is filling them in | until Save succeeds |
+
+The Home Assistant page had the identical bug — a form saved with a button,
+repainted every ten seconds — so a broker address typed slowly was replaced by
+the stored one mid-sentence. It now stops echoing server values as soon as any
+field is touched, and starts again only when the speaker has **accepted** a
+save. Not when the save is sent: if it fails, that is the moment you most need
+to still see what you typed.
+
+Two smaller things came out of the same pass. The alarm list is rebuilt only
+when its HTML actually differs, rather than being thrown away and recreated
+every two seconds — that flicker was visible on a phone and could swallow a
+half-pressed button. And while the alarm editor is open the page backs off to
+polling every ten seconds instead of every two, because nothing behind an open
+editor is worth two-second freshness and the request is served from `loop()` on
+the speaker. It still polls rather than stopping, so an alarm that starts
+ringing mid-edit still raises its **Dismiss** button.
+
+The sleep timer's **standby** checkbox was the same class again: it is read when
+a preset is pressed, which can be a while after it is ticked, and the poll kept
+un-ticking it.
+
+Pages that are only loaded when opened — Lighting, Sound, Wi-Fi, Settings —
+never had this problem and are unchanged.
+
 ## The alarm clock and the sleep timer
 
 Five alarms, on the dashboard's **Alarms** page and visible on the OLED's clock

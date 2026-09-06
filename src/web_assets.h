@@ -555,6 +555,7 @@ function fmtWallTime(h,m){
   return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
 }
 
+let sleepStandbyDirty=false;
 function renderAlarms(d){
   alarmCfg=d;
   const now=d.now||{},list=d.alarms||[];
@@ -569,15 +570,21 @@ function renderAlarms(d){
 
   $('#alarmEmpty').style.display=list.length?'none':'';
   $('#alarmAdd').style.display=list.length>=d.max?'none':'';
-  $('#alarmList').innerHTML=list.map(a=>{
+  /* Rebuilt only when it differs. innerHTML every two seconds throws away
+     and recreates every row and every handler underneath the page, which is
+     visible as a flicker on a phone and loses a half-pressed button. */
+  const alarmHtml=list.map(a=>{
     const bits=[fmtDays(a.days),ALARM_SOURCES[a.source]||'Chime'];
     if(a.fadeSeconds)bits.push(`fades up over ${a.fadeSeconds<60?a.fadeSeconds+'s':Math.round(a.fadeSeconds/60)+' min'}`);
     if(a.skipNext)bits.push('skipping the next one');
     return `<div class="rowitem${a.enabled?' on':''}"><label class="switch" style="padding:0;border:0;background:none;width:auto;margin:0"><input type="checkbox" data-arm="${a.index}" ${a.enabled?'checked':''}></label><span class="grow"><b>${fmtWallTime(a.hour,a.minute)}${a.label?' · '+esc(a.label):''}</b><small>${esc(bits.join(' · '))}</small></span><span class="acts"><button class="btn ghost" data-aedit="${a.index}">Edit</button><button class="btn ghost" data-adel="${a.index}">&times;</button></span></div>`;
   }).join('');
-  $$('#alarmList [data-arm]').forEach(i=>i.onchange=()=>alarmPost({action:'save',index:+i.dataset.arm,enabled:i.checked}));
-  $$('#alarmList [data-aedit]').forEach(b=>b.onclick=()=>alarmEdit(+b.dataset.aedit));
-  $$('#alarmList [data-adel]').forEach(b=>b.onclick=()=>confirmDo('Delete this alarm?','It will be removed from the speaker.',()=>{alarmCloseEditor();alarmPost({action:'delete',index:+b.dataset.adel})}));
+  if($('#alarmList').innerHTML!==alarmHtml){
+    $('#alarmList').innerHTML=alarmHtml;
+    $$('#alarmList [data-arm]').forEach(i=>i.onchange=()=>alarmPost({action:'save',index:+i.dataset.arm,enabled:i.checked}));
+    $$('#alarmList [data-aedit]').forEach(b=>b.onclick=()=>alarmEdit(+b.dataset.aedit));
+    $$('#alarmList [data-adel]').forEach(b=>b.onclick=()=>confirmDo('Delete this alarm?','It will be removed from the speaker.',()=>{alarmCloseEditor();alarmPost({action:'delete',index:+b.dataset.adel})}));
+  }
 
   $('#sleepRunning').style.display=now.sleepRunning?'':'none';
   $('#sleepIdle').style.display=now.sleepRunning?'none':'';
@@ -587,9 +594,29 @@ function renderAlarms(d){
     $('#sleepSub').textContent=left<=60?'Fading out…':`of ${Math.round(total/60)} minutes`;
     $('#sleepMeter').style.width=`${Math.max(0,Math.min(100,100*left/total))}%`;
   }
-  $('#sleepStandby').checked=!!d.sleepStandbyDefault;
+  /* Only echoed until the owner touches it. It is read when a sleep preset
+     is pressed, which can be a while after it is ticked, and a two-second
+     poll that keeps resetting it means the box will not stay ticked. */
+  if(!sleepStandbyDirty)$('#sleepStandby').checked=!!d.sleepStandbyDefault;
 
-  if(alarmEditIndex>=-1&&alarmDraft)alarmPaintEditor();
+  /* The editor is NOT repainted from here, and that is the whole point.
+
+     refresh() calls loadAlarms() every two seconds while this page is open,
+     and this function used to end by repainting the open editor from the
+     draft. Type 09:30 into the time field and two seconds later it was
+     07:00 again -- because nothing wrote the typed value back into the
+     draft, so the repaint restored what the draft still said.
+
+     Binding the inputs to the draft (below) fixes the value being lost, but
+     not the behaviour: a background poll writing into a field somebody is
+     typing in is wrong even when it writes the right thing. It closes a
+     native time picker, it moves the caret, and on a phone it dismisses the
+     keyboard.
+
+     So the split is by ownership. The list, the countdown and the ringing
+     state are the speaker's and refresh freely. The editor belongs to
+     whoever opened it until they save or cancel, and only alarmEdit() and
+     the editor's own controls paint it. */
 }
 
 function alarmEdit(index){
@@ -764,18 +791,27 @@ $('#dlnaEnabled').onchange=async e=>{
 };
 /* --- Home Assistant ---------------------------------------------------- */
 
+/* Set as soon as anything in the broker form is touched, cleared when the
+   page is opened or a Save succeeds. This form is polled every ten seconds
+   and saved with a button, which is the same shape as the alarm editor and
+   had the same bug: type a broker address, and ten seconds later it is the
+   stored one again. The connection status above the form is the speaker's
+   and keeps refreshing; the fields belong to whoever is filling them in. */
+let mqttFormDirty=false;
 function renderMqtt(d){
   mqttCfg=d;
   $('#mqttOffline').style.display=d.modeHasWifi?'none':'';
-  $('#mqttEnabled').checked=d.enabled;
-  $('#mqttHost').value=d.host||'';
-  $('#mqttPort').value=d.port||1883;
-  $('#mqttUser').value=d.user||'';
   $('#mqttPassword').placeholder=d.passwordSet?'Leave blank to keep current':'No password';
-  $('#mqttTopic').value=d.baseTopic||'';
-  $('#mqttDiscovery').checked=d.discovery;
-  $('#mqttDiscoveryPrefix').value=d.discoveryPrefix||'homeassistant';
-  $('#mqttPublish').value=String(d.publishSeconds||15);
+  if(!mqttFormDirty){
+    $('#mqttEnabled').checked=d.enabled;
+    $('#mqttHost').value=d.host||'';
+    $('#mqttPort').value=d.port||1883;
+    $('#mqttUser').value=d.user||'';
+    $('#mqttTopic').value=d.baseTopic||'';
+    $('#mqttDiscovery').checked=d.discovery;
+    $('#mqttDiscoveryPrefix').value=d.discoveryPrefix||'homeassistant';
+    $('#mqttPublish').value=String(d.publishSeconds||15);
+  }
 
   const label={off:'Off',unavailable:'Waiting for the network',connecting:'Connecting…',connected:'Connected',failed:'Could not connect'}[d.state]||d.state;
   $('#mqttState').textContent=label;
@@ -916,6 +952,20 @@ $('#alarmVolume').oninput=()=>{if(alarmDraft){alarmDraft.volume=+$('#alarmVolume
 $('#alarmFade').oninput=()=>{if(alarmDraft){alarmDraft.fadeSeconds=+$('#alarmFade').value;
   $('#alarmFadeText').textContent=alarmDraft.fadeSeconds?(alarmDraft.fadeSeconds<60?`${alarmDraft.fadeSeconds} seconds`:`${Math.round(alarmDraft.fadeSeconds/60)} minutes`):'no fade'}};
 $('#alarmSkip').onchange=()=>{if(alarmDraft)alarmDraft.skipNext=$('#alarmSkip').checked};
+/* The time, the label and the two durations feed the draft as they are
+   typed. Without this they were read only when Save was pressed, so any
+   repaint in between -- clicking Weekdays, changing the source -- restored
+   the value the draft still held and silently discarded what was typed.
+   That was true before the poll ever entered into it. */
+$('#alarmTime').oninput=()=>{
+ if(!alarmDraft)return;
+ const [h,m]=($('#alarmTime').value||'').split(':').map(Number);
+ if(Number.isFinite(h)&&Number.isFinite(m)){alarmDraft.hour=h;alarmDraft.minute=m}
+};
+$('#alarmLabel').oninput=()=>{if(alarmDraft)alarmDraft.label=$('#alarmLabel').value};
+$('#alarmDuration').onchange=()=>{if(alarmDraft)alarmDraft.durationSeconds=+$('#alarmDuration').value};
+$('#alarmSnoozeMins').onchange=()=>{if(alarmDraft)alarmDraft.snoozeMinutes=+$('#alarmSnoozeMins').value};
+$('#sleepStandby').onchange=()=>{sleepStandbyDirty=true};
 $('#alarmSave').onclick=()=>{
   if(!alarmDraft)return;
   const [h,m]=($('#alarmTime').value||'07:00').split(':').map(Number);
@@ -926,7 +976,7 @@ $('#alarmSave').onclick=()=>{
     snoozeMinutes:+$('#alarmSnoozeMins').value,skipNext:$('#alarmSkip').checked,
     label:$('#alarmLabel').value.trim()}).then(alarmCloseEditor);
 };
-$$('#sleepPresets button').forEach(b=>b.onclick=()=>alarmPost({action:'sleep',minutes:+b.dataset.min,standby:$('#sleepStandby').checked}));
+$$('#sleepPresets button').forEach(b=>b.onclick=()=>{sleepStandbyDirty=false;alarmPost({action:'sleep',minutes:+b.dataset.min,standby:$('#sleepStandby').checked})});
 $('#sleepStart').onclick=()=>{
   const m=+$('#sleepCustom').value;
   if(!m)return toast('How many minutes?',true);
@@ -945,6 +995,13 @@ $('#mqttAnnounce').onclick=async()=>{
   try{await api('/api/mqtt',{method:'POST',body:{action:'announce'}});toast('Sent to Home Assistant')}
   catch(e){toast(e.message,true)}
 };
+/* One listener per field rather than a delegated one, because these are not
+   inside a shared container that nothing else lives in. */
+['mqttEnabled','mqttHost','mqttPort','mqttUser','mqttTopic','mqttDiscovery',
+ 'mqttDiscoveryPrefix','mqttPublish'].forEach(id=>{
+  const el=$('#'+id);
+  if(el)el.addEventListener('input',()=>{mqttFormDirty=true});
+});
 $('#mqttSave').onclick=async()=>{
   const body={enabled:$('#mqttEnabled').checked,host:$('#mqttHost').value.trim(),
     port:+$('#mqttPort').value||1883,user:$('#mqttUser').value.trim(),
@@ -955,7 +1012,12 @@ $('#mqttSave').onclick=async()=>{
      firmware never sends it back. */
   const pw=$('#mqttPassword').value;
   if(pw)body.password=pw;
-  try{renderMqtt(await api('/api/mqtt',{method:'POST',body}));$('#mqttPassword').value='';toast('Saved')}
+  /* The dirty flag is cleared only once the speaker has accepted the form.
+     Clearing it before the request would let the next poll overwrite the
+     fields with the stored values if the save failed, which is the moment
+     somebody most needs to still see what they typed. */
+  try{const saved=await api('/api/mqtt',{method:'POST',body});
+    mqttFormDirty=false;renderMqtt(saved);$('#mqttPassword').value='';toast('Saved')}
   catch(e){toast(e.message,true)}
 };
 $('#mqttEnabled').onchange=()=>$('#mqttSave').click();
@@ -1002,7 +1064,12 @@ function refreshActivePage(s){
      connection statistics do not move like that, and two hours of history moves
      once a minute, so both are fetched far more slowly. */
   if($('#page-radio').classList.contains('active'))loadRadio();
-  if($('#page-alarms').classList.contains('active'))loadAlarms();
+  /* Backed off to every ten seconds while the editor is open. Nothing behind
+     an open editor is worth two-second freshness, and the fetch itself is
+     served from loop() on the speaker. Still polled rather than stopped, so
+     an alarm that starts ringing mid-edit still raises its Dismiss button. */
+  if($('#page-alarms').classList.contains('active')&&
+     (!alarmDraft||(pageTick%5)===0))loadAlarms();
   if($('#page-hass').classList.contains('active')&&(pageTick%5)===0)loadMqtt();
   if($('#page-graphs').classList.contains('active')&&(pageTick%30)===0)loadGraphs();
   pageTick++;
@@ -1071,7 +1138,7 @@ if(name==='sound')loadAudio();
 if(name==='radio'){loadRadio();loadDlna()};
 if(name==='alarms'){loadAlarms();loadSettings()}
 if(name==='graphs')loadGraphs();
-if(name==='hass')loadMqtt();if(name==='media'){if(status)renderDfPage(status.dfplayer||{});refresh();loadDfLibrary()}else{dfLibPoll(false)}if(name==='settings'&&settings&&settings.power&&settings.power.wokeFromSleep)toast('This speaker woke from standby')}
+if(name==='hass'){mqttFormDirty=false;loadMqtt()}if(name==='media'){if(status)renderDfPage(status.dfplayer||{});refresh();loadDfLibrary()}else{dfLibPoll(false)}if(name==='settings'&&settings&&settings.power&&settings.power.wokeFromSleep)toast('This speaker woke from standby')}
 $$('[data-page]').forEach(b=>b.onclick=()=>page(b.dataset.page));
 $('#loginForm').onsubmit=async e=>{e.preventDefault();let raw=`admin:${$('#loginPassword').value}`;auth='Basic '+btoa(unescape(encodeURIComponent(raw)));try{await api('/api/auth');sessionStorage.setItem('speakerAuth',auth);$('#loginModal').classList.remove('show');$('#loginError').textContent='';await refresh();loadSettings();clearInterval(pollTimer);pollTimer=setInterval(refresh,2000)}catch(err){auth='';$('#loginError').textContent='Incorrect password. Please try again.'}};
 async function media(action,value){try{await api('/api/media',{method:'POST',body:{action,value}});setTimeout(refresh,180)}catch(e){toast(e.message,true)}}
