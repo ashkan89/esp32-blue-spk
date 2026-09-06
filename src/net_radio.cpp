@@ -244,6 +244,27 @@ uint8_t *chunk;   // arena + ringBytes
 uint8_t *feed;    // arena + ringBytes + READ_CHUNK
 size_t ringHead, ringTail, ringUsed;
 
+/*
+ * The ID3v2 tag in front of a file, and why it is dropped here.
+ *
+ * A station never starts with one; a file pushed by a UPnP controller nearly
+ * always does, and the one that first got this far carried 237 kB of embedded
+ * artwork in it. libhelix cannot decode a JPEG, so it scans it byte by byte
+ * for a sync word, finding false ones and failing on each -- a burst of CPU
+ * that produces no audio, during which the I2S write that is supposed to pace
+ * this task never blocks (see the yield below for why that matters on a task
+ * that shares a core with loop() at a higher priority). The tag says how long
+ * it is in its own header, so the whole of it is skipped in one arithmetic
+ * step instead, and the decoder meets the first real frame immediately.
+ */
+struct Id3Skip {
+  bool checked;      ///< the first ten bytes have been looked at
+  uint8_t head[10];  ///< those ten bytes, collected across reads if need be
+  uint8_t headLen;
+  uint32_t pending;  ///< tag bytes still to discard
+};
+Id3Skip id3;
+
 /// The favourites. On the heap and not in .bss because 2.4 kB of DRAM that only
 /// two of the three radio modes can ever use is 2.4 kB Bluedroid does not get
 /// in the third.
@@ -557,6 +578,43 @@ size_t ringWrite(const uint8_t *data, size_t len) {
   return written;
 }
 
+/*
+ * Puts one socket read into the ring, minus any ID3v2 tag at the very start.
+ *
+ * The header is ten bytes: "ID3", two version bytes, flags, and a 28-bit
+ * synchsafe size that does not include the header itself (or the optional
+ * ten-byte footer, flag 0x10). Anything that is not a tag goes straight
+ * through, including the ten bytes that were held back to look at it.
+ */
+void ringWriteAudio(uint8_t *data, size_t len) {
+  size_t off = 0;
+  if (!id3.checked) {
+    while (id3.headLen < sizeof(id3.head) && off < len) id3.head[id3.headLen++] = data[off++];
+    if (id3.headLen < sizeof(id3.head)) return;  // still collecting the header
+    id3.checked = true;
+    const uint8_t *h = id3.head;
+    const bool tag = h[0] == 'I' && h[1] == 'D' && h[2] == '3' && h[3] < 0xFF &&
+                     h[4] < 0xFF && !(h[6] & 0x80) && !(h[7] & 0x80) &&
+                     !(h[8] & 0x80) && !(h[9] & 0x80);
+    if (tag) {
+      uint32_t size = ((uint32_t)h[6] << 21) | ((uint32_t)h[7] << 14) |
+                      ((uint32_t)h[8] << 7) | h[9];
+      if (h[5] & 0x10) size += 10;  // footer present
+      id3.pending = size;
+      LOGF("[radio] skipping a %u kB ID3v2.%u tag ahead of the audio\n",
+           (unsigned)((size + 10) / 1024), (unsigned)h[3]);
+    } else {
+      ringWrite(id3.head, sizeof(id3.head));  // not a tag: it is audio
+    }
+  }
+  if (id3.pending) {
+    const size_t drop = min((size_t)id3.pending, len - off);
+    id3.pending -= (uint32_t)drop;
+    off += drop;
+  }
+  if (off < len) ringWrite(data + off, len - off);
+}
+
 size_t ringRead(uint8_t *out, size_t len) {
   size_t taken = 0;
   while (taken < len && ringUsed > 0) {
@@ -789,6 +847,47 @@ void runStream(const char *url, bool *stopped) {
    */
   stream->httpRequest().setAgent("esp32-blue-spk");
 
+  /*
+   * The HTTP header line buffers, sized before the library touches them.
+   *
+   * This is the fix for the heap corruption that took the WROVER down every
+   * time a controller pressed Play, and it deserves precision, because three
+   * different-looking panics were chased before the heap guard caught the
+   * write in the act.
+   *
+   * HttpHeader (arduino-audio-tools v1.2.5, HttpHeader.h) declares the buffer
+   * it composes and parses header lines in as
+   *
+   *     Vector<char> temp_buffer{HTTP_MAX_LEN};
+   *
+   * meaning to reserve 1024 bytes. On ESP32 the library defines
+   * USE_INITIALIZER_LIST, which gives Vector an initializer_list constructor,
+   * and C++ list-initialisation picks that constructor whenever it is viable.
+   * So {1024} is a list of ONE char -- 1024 narrowed to 0; the library
+   * silences -Wnarrowing in AudioToolsConfig.h, which is the only reason it
+   * compiles -- and temp_buffer is one byte long. Every header line the
+   * library writes ("Accept: audio/mpeg", "Accept-Encoding: identity", ...)
+   * and every line it reads back from the server ("Accept-Ranges: bytes",
+   * "Content-Type: audio/mpeg", ...) then goes through a 1-byte heap block
+   * into whatever the allocator placed after it.
+   *
+   * That is exactly the text the guard found in the smashed canaries
+   * (0x70656363 = "ccep", 0x69647561 = "audi", 0x706d2f6f = "o/mp"), and it
+   * is why the damage landed on a List<HttpHeaderLine*> node once, on
+   * loopTask's stack canary once and on a TCP PCB once: it hit whichever
+   * block happened to be next. It is also why the station-from-the-dashboard
+   * test crashed identically -- the request the library composes is the same
+   * for every URL.
+   *
+   * HttpHeader::resize() is public and grows the Vector properly. It is called
+   * on both headers every time, because a new ICYStream is built per stream
+   * and its Vectors are freshly (mis)constructed with it. This is a workaround
+   * for a library defect, not a tuning knob: it must stay while the pinned
+   * library declares the buffer with braces.
+   */
+  stream->httpRequest().header().resize(HTTP_MAX_LEN);
+  stream->httpRequest().reply().resize(HTTP_MAX_LEN);
+
   setState(RADIO_CONNECTING);
   /*
    * The whole address and its length, before the HTTP client sees it.
@@ -864,12 +963,14 @@ void runStream(const char *url, bool *stopped) {
   output.reset();
   decoder->begin();
 
+  id3 = Id3Skip{};
   ringClear();
   setState(RADIO_BUFFERING);
   adoptMetadata();
 
   const size_t prebuffer = prebufferBytes();
   bool decoding = false;
+  bool finished = false;  ///< the media ended, as opposed to the connection
   uint32_t lastByteAt = millis();
   uint32_t lastPercentAt = 0;
 
@@ -883,11 +984,19 @@ void runStream(const char *url, bool *stopped) {
 
     // Fill.
     const size_t space = ringBytes - ringUsed;
-    if (space >= 512 && stream->available() > 0) {
+    /*
+     * Two checks, because they answer different questions for a chunked reply:
+     * the library's available() is what is left of the current chunk, not what
+     * the socket holds. Reading on the first alone finds an empty socket, and
+     * the library logs an error line for every such poll -- dozens a second,
+     * which at 115200 baud is enough to stall the decoder sharing this task.
+     */
+    if (space >= 512 && stream->available() > 0 &&
+        stream->httpRequest().client().available() > 0) {
       const size_t want = min(space, READ_CHUNK);
       const size_t got = stream->readBytes(chunk, want);
       if (got > 0) {
-        ringWrite(chunk, got);
+        ringWriteAudio(chunk, got);
         lastByteAt = millis();
         statusLock();
         status.bytes += got;
@@ -897,11 +1006,33 @@ void runStream(const char *url, bool *stopped) {
 
     adoptMetadata();
 
+    /*
+     * A file ends; a station does not.
+     *
+     * A pushed track arrives with a Content-Length, and when that many bytes
+     * have been read there is nothing more coming -- which is not an error, not
+     * a reason to reconnect, and certainly not a reason to fetch the whole song
+     * again from the top, which is what the reconnect path would do. Once the
+     * ring has been played out the stream is finished and the transport goes
+     * idle, which is what tells a controller to send the next track. A live
+     * stream has no Content-Length and none of this applies to it.
+     */
+    const int contentLength = stream->contentLength();
+    const bool eof = contentLength > 0 &&
+                     (long)stream->totalRead() >= (long)contentLength;
+    if (eof && ringUsed == 0) {
+      LOGF("[radio] end of the media after %u bytes\n", (unsigned)contentLength);
+      finished = true;
+      break;
+    }
+
     if (!*stream) {
       setState(RADIO_ERROR, "The station closed the connection");
       break;
     }
-    if ((uint32_t)(millis() - lastByteAt) > STALL_TIMEOUT_MS) {
+    // Not while the tail of a finished file is still playing out of the ring:
+    // nothing is meant to be arriving then.
+    if (!eof && (uint32_t)(millis() - lastByteAt) > STALL_TIMEOUT_MS) {
       setState(RADIO_ERROR, "The stream stopped sending");
       break;
     }
@@ -918,7 +1049,7 @@ void runStream(const char *url, bool *stopped) {
     }
 
     if (!decoding) {
-      if (ringUsed < prebuffer) {
+      if (ringUsed < prebuffer && !eof) {
         // Nothing to do but wait for the socket. Yielding here rather than
         // spinning is what keeps the Wi-Fi task fed while the buffer fills.
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -949,8 +1080,19 @@ void runStream(const char *url, bool *stopped) {
     }
 
     const size_t take = ringRead(feed, DECODE_CHUNK);
-    // This blocks inside the I2S write, which is what paces the whole loop.
+    /*
+     * This blocks inside the I2S write, which is what paces the whole loop --
+     * when the decoder produces audio. When it does not (bytes it cannot sync
+     * to, a codec that does not match the container) the write returns at
+     * once, and a task pinned to loop()'s core at a higher priority that never
+     * blocks is a task that has switched the console, the dashboard and the
+     * renderer off. So a write that came back without waiting is followed by
+     * the shortest possible yield. In normal playback each write waits tens of
+     * milliseconds on the DMA queue and this costs nothing at all.
+     */
+    const uint32_t wroteAt = millis();
     decoder->write(feed, take);
+    if ((uint32_t)(millis() - wroteAt) < 2) vTaskDelay(1);
   }
 
   /*
@@ -973,7 +1115,13 @@ void runStream(const char *url, bool *stopped) {
   // that is retrying on a backoff is not sitting on 22 kB while it waits.
   arenaRelease();
 
-  *stopped = request.changed && !request.play;
+  /*
+   * A finished file is a stop. Clearing the play request is what keeps the
+   * task from opening the same URL again on its next pass; it is left alone if
+   * a new request has landed in the meantime, because that one wins.
+   */
+  if (finished && !request.changed) request.play = false;
+  *stopped = finished || (request.changed && !request.play);
 }
 
 void radioTask(void *) {
@@ -1159,6 +1307,13 @@ bool net_radio_active() {
   if (!running) return false;
   const RadioState state = status.state;
   return state == RADIO_PLAYING || state == RADIO_BUFFERING;
+}
+
+bool net_radio_owns_dac() {
+  if (!running) return false;
+  // The request is what the task acts on next; the state is what it is doing
+  // now. Either one means the channel is spoken for.
+  return request.play || net_radio_active();
 }
 
 void net_radio_snapshot(RadioStatus *out) {

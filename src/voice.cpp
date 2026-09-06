@@ -355,6 +355,12 @@ size_t voice_render(int16_t *interleaved, size_t frames) {
   return produced;
 }
 
+void voice_yield_to_mixer() {
+  taskENTER_CRITICAL(&queueMux);
+  if (owner == OWNER_LOOP) owner = OWNER_NONE;
+  taskEXIT_CRITICAL(&queueMux);
+}
+
 bool voice_mix(int16_t *interleaved, size_t frames) {
   if (!interleaved || frames == 0) return false;
 

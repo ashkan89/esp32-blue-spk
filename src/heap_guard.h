@@ -3,6 +3,28 @@
  * happens, and name what the firmware was doing.
  *
  * ---------------------------------------------------------------------------
+ * RESOLVED -- what the guard found
+ * ---------------------------------------------------------------------------
+ *
+ * It worked on the first cast: "CORRUPT HEAP: Bad tail at 0x3ffe3141. Expected
+ * 0xbaad5678 got 0x70656363", mark "radio: opening the stream", ~60 ms after
+ * the URL was logged. 0x70656363 is "ccep"; the next reboot's registers held
+ * "audi" and "o/mp". The overrun was writing HTTP header text -- "Accept:
+ * audio/mpeg" -- and the block it overran was one byte long: HttpHeader in
+ * arduino-audio-tools declares its 1 kB line buffer with braces,
+ * Vector<char>{HTTP_MAX_LEN}, which on ESP32 selects the initializer_list
+ * constructor and builds a one-element vector. The fix and the full reasoning
+ * are in runStream() in net_radio.cpp, next to the two resize() calls.
+ *
+ * Every panic on this page was that one write landing somewhere else. The
+ * guard stays in the build: it is cheap, and it turns the next stray write
+ * into a line with a mark instead of another week of backtraces.
+ *
+ * ---------------------------------------------------------------------------
+ * The reasoning that led here, as it was written
+ * ---------------------------------------------------------------------------
+ *
+ * ---------------------------------------------------------------------------
  * Why this exists
  * ---------------------------------------------------------------------------
  *
@@ -104,10 +126,20 @@ void heap_guard_mark(const char *where);
  */
 bool heap_guard_check(const char *where);
 
+/*
+ * Called once per pass of loop(). The monitor task watches the count, and
+ * when it stops moving for a few seconds prints what the firmware was doing
+ * and what the radio task is up to -- because the radio task shares loop()'s
+ * core at a higher priority, and a decode loop that stops blocking takes the
+ * console, the dashboard and the renderer with it while ping still answers.
+ */
+void heap_guard_loop_tick();
+
 #else
 
 static inline void heap_guard_begin() {}
 static inline void heap_guard_mark(const char *) {}
 static inline bool heap_guard_check(const char *) { return true; }
+static inline void heap_guard_loop_tick() {}
 
 #endif

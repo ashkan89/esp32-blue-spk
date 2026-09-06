@@ -490,7 +490,10 @@ void soft_clock_begin() {
     // rule that stopped parsing between firmware versions must not take the
     // clock with it, because the clock is what the alarm runs on.
     char stored[sizeof(g_zone)];
-    const String rule = g_prefs.getString(ZONE_KEY, "");
+    // isKey() first: Preferences::getString() logs an [E] line for a key that
+    // was never written, and a speaker whose owner never set a zone is normal.
+    const String rule =
+        g_prefs.isKey(ZONE_KEY) ? g_prefs.getString(ZONE_KEY, "") : String();
     if (rule.length() && rule.length() < sizeof(stored)) {
       snprintf(stored, sizeof(stored), "%s", rule.c_str());
       if (zone_is_usable(stored)) snprintf(g_zone, sizeof(g_zone), "%s", stored);

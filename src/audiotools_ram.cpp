@@ -3,65 +3,53 @@
  * RAM, the way they are on a board with no external RAM at all.
  *
  * ---------------------------------------------------------------------------
- * What this is for
+ * History, and why this file still exists
  * ---------------------------------------------------------------------------
  *
- * On the WROVER, asking a UPnP controller to play a track panics before the
- * request has even left the chip:
+ * This wrap was written as a theory. On the WROVER, asking a UPnP controller
+ * to play a track panicked inside the HTTP client:
  *
- *   [radio] opening (82 chars): http://192.168.68.72:10246/MDEServer/.../1000.mp3
- *   Guru Meditation Error: Core 1 panic'ed (LoadProhibited)
- *   EXCVADDR: 0x00000060
  *   radioTask -> ICYStream::begin -> URLStream::begin -> HttpRequest::processBegin
- *             -> HttpHeader::write -> writeHeaderLine
+ *             -> HttpHeader::write -> writeHeaderLine    (LoadProhibited, 0x60)
  *
- * HttpHeader::write() walks its list of header lines and does
- * `writeHeaderLine(out, *line_ptr)`. HttpHeaderLine is `Str key; Str value;
- * bool active;` and `active` sits at offset 0x60 -- exactly the faulting
- * address. So one entry in that list is a null pointer. Upstream has no guard:
- * `new HttpHeaderLine(key)` is pushed without a null check, and write()
- * dereferences without one, on main as well as on the pinned v1.2.5.
+ * a null entry in a List<HttpHeaderLine*>. The one thing that differed between
+ * the WROOM, which played, and the WROVER, which did not, was that AudioTools'
+ * DefaultAllocator calls ps_malloc() first -- so on the WROVER the library's
+ * collections had moved to external RAM. Hence this file: wrap ps_malloc() and
+ * ps_calloc() at link time to answer null, and the library falls back to
+ * malloc() as it always had on the WROOM.
  *
- * Two things follow from the backtrace, and the second is the useful one.
+ * The theory was wrong, and the heap guard (heap_guard.cpp) said so on the
+ * first cast after it went in: "CORRUPT HEAP: Bad tail ... got 0x70656363"
+ * ("ccep"), while the radio was opening the stream. The null pointer was one
+ * face of a heap overrun that wrote HTTP header text -- "Accept: audio/mpeg"
+ * -- through a ONE-BYTE buffer. arduino-audio-tools' HttpHeader declares its
+ * 1 kB line buffer as Vector<char> temp_buffer{HTTP_MAX_LEN}; on ESP32 the
+ * library enables initializer_list constructors, so that is a one-element
+ * vector, and it silences -Wnarrowing, which is why it compiles at all. Every
+ * header line written or read went through that byte into the next heap
+ * block. The fix is two HttpHeader::resize() calls in runStream(), in
+ * net_radio.cpp, with the full account beside them.
  *
- * The connection is already open when this happens -- processBegin() connects
- * before it writes -- so the crash is in composing the REQUEST. It cannot
- * depend on the server, and it cannot depend on the URL: a saved station and a
- * pushed file produce byte-identical code here. Whatever this is, it is not
- * specific to DLNA.
- *
- * What IS specific is the board. AudioTools' DefaultAllocator is an
- * AllocatorExt, whose do_allocate() calls ps_malloc() first and only falls back
- * to malloc() when that returns null. Every Vector and every List in the
- * library goes through it -- including the List<HttpHeaderLine*> that faults.
- * On a WROOM ps_malloc() always returns null, so all of it lands in internal
- * RAM and has done so for the life of this project. On a WROVER it succeeds,
- * and the library's collections move to external RAM for the first time.
- *
- * That is the only difference between the two builds on this code path, and
- * upstream discussion reports URLStream instability on PSRAM boards with the
- * same shape of workaround: force those allocations back to internal RAM.
+ * Why it panicked on the WROVER and not on the WROOM is then a matter of what
+ * the allocator happened to place after a one-byte block, not of PSRAM.
  *
  * ---------------------------------------------------------------------------
- * How
+ * What the wrap does, and why it is kept for now
  * ---------------------------------------------------------------------------
  *
- * ps_malloc() and ps_calloc() are wrapped at link time and answer null, which
- * is precisely what they answer on a board with no PSRAM. AllocatorExt then
- * takes its documented fallback and calls malloc(). Nothing is patched, no
- * library source is edited, and the libraries behave exactly as they do in the
- * configuration that has always worked.
+ * ps_malloc() and ps_calloc() answer null, which is precisely what they answer
+ * on a board with no PSRAM. AllocatorExt takes its documented fallback and
+ * calls malloc(). No library source is edited. The buffers this firmware
+ * actually wants in external RAM -- the jitter buffer (up to 512 kB) and the
+ * renderer's scratch -- go through board_alloc(), which calls
+ * heap_caps_malloc(MALLOC_CAP_SPIRAM) directly and is untouched.
  *
- * This does NOT give up external RAM. The buffers this firmware actually wants
- * out there are allocated by board_alloc(), which calls
- * heap_caps_malloc(MALLOC_CAP_SPIRAM) directly and is untouched by this:
- *
- *   the radio's jitter buffer   up to 512 kB
- *   the UPnP renderer's scratch ~10 kB
- *
- * Only the audio libraries' own small collections move, and they are small:
- * header lines, decoder tables, the socket chunk. They fit in internal RAM
- * because they always have.
+ * It is kept as parity, not as a fix: with it both boards run the audio
+ * libraries with identical allocation behaviour, which is one less variable
+ * while the real fix proves itself. The cost is roughly 10 kB of internal RAM
+ * while a stream is open (two 1 kB header buffers, the ICY metadata buffer,
+ * the header line strings, the decoder wrapper's vectors).
  *
  * ---------------------------------------------------------------------------
  * Turning it off
@@ -69,16 +57,11 @@
  *
  *     build_flags = ... -DAUDIOTOOLS_PSRAM=1
  *
- * gives the libraries external RAM back, which is the configuration that
- * panics. It exists so the two can be compared in one rebuild rather than
- * argued about -- if the panic follows the flag, this file is the explanation;
- * if it does not, this file is wrong and should be deleted rather than left
- * standing as a superstition.
- *
- * The wrap flags are in platformio.ini and apply to both targets, so the two
- * boards run the same code with the same allocation behaviour. On the WROOM
- * the wrappers are reached and return null, which is what the real ps_malloc()
- * would have done anyway -- there is nothing to be inconsistent about.
+ * gives the libraries external RAM back and reclaims that internal RAM. With
+ * the header buffers sized correctly there is no known reason it should not
+ * be clean; if a week of casting with the flag on is clean, delete this file
+ * and the two -Wl,--wrap flags in platformio.ini rather than leaving them as a
+ * superstition.
  */
 
 #include <stddef.h>

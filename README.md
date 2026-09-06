@@ -2925,14 +2925,136 @@ also keeps unauthenticated UPnP traffic off the authenticated dashboard. It
 costs one listening socket and one UDP socket, both serviced from `loop()` — no
 extra task, and its working buffers live in external RAM rather than on that
 task's stack, for the reason the section above is about. Every operation is bounded: a request that does not
-arrive within 3 s is dropped, a body over 4 kB is refused, and at most one
+arrive within 600 ms is dropped, a body over 4 kB is refused, and at most one
 `NOTIFY` is sent per loop pass so a controller that walked away cannot stall
-anything with a connect timeout.
+anything with a connect timeout. Connections are persistent, as HTTP/1.1
+controllers expect: a connection is kept after its response and the next
+request on it is served there, and it is closed when the controller closes it
+or after four seconds idle — the side that closes first sits in TIME-WAIT for
+two minutes, and this build has sixteen TCP PCBs in total.
 
-### Open: a LoadProhibited panic when a controller presses Play
+### Resolved: the panics when a controller presses Play
 
-**Status: unresolved.** On the WROVER, pushing a track from a UPnP controller
-reaches the point of opening the stream and then panics inside the HTTP client:
+**Status: resolved.** The heap guard caught it on the first cast after it went
+in:
+
+```
+[radio] opening (72 chars): http://192.168.68.53:43615/msp/MEDIA/527/_data/527.mp3?mt=...
+CORRUPT HEAP: Bad tail at 0x3ffe3141. Expected 0xbaad5678 got 0x70656363
+  #4  (anonymous namespace)::check(char const*) at src/heap_guard.cpp:222
+```
+
+`0x70656363` is the ASCII `"ccep"`. The next reboot's registers held `"audi"`
+and `"o/mp"`. Something was writing HTTP header text — `Accept: audio/mpeg`,
+`Accept-Ranges: bytes` — past the end of a heap block, and the block was one
+byte long.
+
+#### Root cause: a one-byte buffer in the library
+
+`HttpHeader` in `arduino-audio-tools` v1.2.5 declares the buffer it composes
+and parses every header line in as
+
+```cpp
+Vector<char> temp_buffer{HTTP_MAX_LEN};   // meant: reserve 1024 bytes
+```
+
+On ESP32 the library defines `USE_INITIALIZER_LIST`, which gives its `Vector`
+an `initializer_list` constructor — and C++ list-initialisation picks that
+constructor whenever it is viable. So `{1024}` is a list of **one** `char`
+(1024 narrowed to 0), and the library silences `-Wnarrowing` in
+`AudioToolsConfig.h`, which is the only reason that line compiles. Every header
+line the library writes (`Accept: audio/mpeg`, `Accept-Encoding: identity`)
+and every line it reads back from the server (`Content-Type: audio/mpeg`,
+`Accept-Ranges: bytes`) went through a 1-byte heap block into whatever the
+allocator had placed after it.
+
+That is why the same defect wore three faces: a null node in
+`List<HttpHeaderLine*>`, the canary at the base of `loopTask`'s stack, and a
+TCP PCB with an impossible state were simply the three blocks that happened to
+sit after a one-byte allocation on three different boots. It is also why a
+saved station crashed exactly like a pushed file: the request the library
+composes is the same for every URL, and why it looked PSRAM-related — the wrap
+in `audiotools_ram.cpp` only changed *which* block sat after the small one.
+
+#### The fix
+
+`HttpHeader::resize()` is public and grows the vector properly.
+[src/net_radio.cpp](src/net_radio.cpp) now calls it on both the request and
+the reply header, every time a stream is built, before `begin()`:
+
+```cpp
+stream->httpRequest().header().resize(HTTP_MAX_LEN);
+stream->httpRequest().reply().resize(HTTP_MAX_LEN);
+```
+
+Two lines; the account beside them in the source is long on purpose. The
+`ps_malloc` wrap stays for now as parity between the two boards (see the note
+in `platformio.ini` for how to retire it), and the heap guard stays because it
+is cheap and it is what turned a week of backtraces into one line with a mark.
+
+#### The second fault, found by the instrument the first one paid for
+
+With the header buffer fixed, the first pushed track opened, filled its
+buffer and played to the end — and for the whole of its three minutes the
+console, the dashboard and the renderer were dark while the board still
+answered ping. A `loop()` stall detector added to the guard task (which lives
+on the other core) said what it saw every five seconds:
+
+```
+[heap] *** loop() has not run for 43 s *** last mark: radio: sizing the jitter buffer
+[heap] loopTask: state 1, headroom 8460 bytes (0 running, 1 ready, 2 blocked, 3 suspended)
+[heap] radio task: state 0
+[heap] radio: playing, 2059668 bytes in, buffer 100%, 0 underruns
+```
+
+`loopTask` alternating between *ready* and *blocked* without ever reaching
+the top of `loop()` is a wait inside one pass, not starvation — and the moment
+the track ended (`[radio] end of the media`) the very next line was
+`loop() is running again`. The wait was in the announcement player.
+`service_voice()` deferred to the DAC only when `net_radio_active()` said
+audio was flowing; while the radio was still *connecting* it claimed the
+"connecting" clip and began writing it to I2S itself, chunk by chunk. Then the
+decoder task — same core, higher priority — started saturating the same
+channel, and every one of the loop task's remaining chunk writes queued behind
+it for the length of the track.
+
+Three changes, all in the direction of "the radio owns the channel from the
+request onward":
+
+* `net_radio_owns_dac()` answers true from the moment a stream is asked for,
+  and `dac_busy()` uses it instead of `net_radio_active()`;
+* `service_voice()` asks before **every** chunk, and when the channel becomes
+  someone else's mid-clip it calls `voice_yield_to_mixer()` — the clip is not
+  dropped, `voice_mix()` claims it on the audio task's next buffer and finishes
+  it ducked under the music;
+* the decode loop follows any I2S write that returned without waiting with a
+  one-tick yield, so a decoder producing no audio can never monopolise the
+  core either.
+
+Two smaller things the same tracks turned up, both fixed in
+[src/net_radio.cpp](src/net_radio.cpp): a pushed file begins with an ID3v2
+tag — 237 kB of embedded artwork in the first one — which the decoder was
+scanning byte by byte for sync words, so the tag is now read from its own
+header and skipped in one step; and a file *ends*, which a station never does,
+so when `Content-Length` bytes have been read and the ring has played out the
+transport goes idle and reports `STOPPED` (the controller then sends the next
+track) instead of treating the end as a dropped connection and fetching the
+whole song again from the top.
+
+Verified on the bench: two tracks pushed back to back from an Android
+controller played through with the console answering, the renderer's
+description served in ~40 ms during playback, and no stall report. The
+detector stays in the build; it costs a counter increment per `loop()` pass.
+
+#### The investigation, as it was written
+
+What follows is the record of how this was chased, kept because every step
+ruled something out and the reasoning about *corruption versus depth* is what
+led to building the instrument that found it. Theories in it that are now
+known to be wrong are marked as such.
+
+On the WROVER, pushing a track from a UPnP controller reached the point of
+opening the stream and then panicked inside the HTTP client:
 
 ```
 [radio] opening (82 chars): http://192.168.68.72:10246/MDEServer/3C16.../1000.mp3
@@ -3008,6 +3130,11 @@ this reasoning is wrong and that is worth knowing too — which makes playing a
 station from the dashboard the single most informative thing to try.
 
 #### The leading theory: the library's collections in external RAM
+
+> **Falsified.** The wrap described here went in, and the panic did not follow
+> the flag — the next crash was the "stack overflow in loopTask" below, on the
+> same build. The real cause is the one-byte header buffer at the top of this
+> section. The wrap is kept only as parity between the two boards.
 
 What *is* different between the two builds on this path is where AudioTools
 puts its own memory.
@@ -3258,10 +3385,43 @@ firmware is the active closer far more often than it looks:
 * the dashboard polls on top of both.
 
 A handful of casts and a minute of an open dashboard can therefore pin all
-sixteen slots, after which new connections fail and lwIP is permanently
-recycling TIME-WAIT entries. That is a real defect independent of the
-corruption, and the guard now prints the count whenever it comes within two of
-the ceiling, so it stops being a suspicion and becomes a number.
+sixteen slots. It is not fatal — `tcp_alloc()` evicts the oldest TIME-WAIT
+entry when the seventeenth connection arrives, and esp-lwip enforces the
+sixteen even though its pools are malloc-backed — but a slot pinned for two
+minutes by a request that took two milliseconds is the wrong way round, and
+the guard prints the count whenever it comes within two of the ceiling so it
+is a number rather than a suspicion.
+
+The first attempt parked each answered connection for a second and waited
+for the controller's FIN, so that the close would be the passive one. The
+guard's report was then taught to say **which local port** holds the TIME-WAIT
+entries, and it showed every one of them still belonging to the renderer: the
+Android controller does not hang up after a response, it keeps the connection
+and sends its next request down it, as HTTP/1.1 allows. Discarding what
+arrived and closing after a second was worse than the original.
+
+So the renderer now speaks HTTP/1.1 the way the client does. A connection
+stays open after its response (up to six at a time), a request arriving on it
+is served from `loop()` — one per pass, so a chatty controller cannot hold the
+loop — and it is closed when the controller closes it or after four seconds
+idle. A controller polling once a second lives on one connection instead of
+costing a PCB per poll. Outbound `NOTIFY` sockets sit in the same table with
+the controller's `200 OK` discarded on the way to its FIN. Measured after the
+change, with a phone casting: **renderer 0** TIME-WAIT entries. The fourteen
+that remain belong to the dashboard's `WebServer` on port 80 while a browser
+has it open, which is that library's own close-per-request behaviour and a
+separate matter. (`SO_LINGER` with a zero timeout is not an answer to any of
+this: lwIP only aborts on it when unsent data remains, and otherwise closes
+normally into TIME-WAIT.)
+
+Two timeouts in the same file were also wrong by a factor of a thousand.
+`NetworkClient` on this core has no `setTimeout()` of its own, so the
+renderer's `setTimeout(1)` and `setTimeout(2)` were `Stream`'s per-read
+timeout in **milliseconds** — a request whose headers arrived in two segments
+was cut off after a millisecond. They are now 100 ms per read inside the
+600 ms request deadline, and the `NOTIFY` connect has an explicit 500 ms
+connection timeout, because the stall detector caught a dozing phone that
+reset inbound connections costing `loop()` 3 s for two subscriptions.
 
 #### One earlier change, on a weaker suspicion
 
@@ -3272,7 +3432,8 @@ mutates the header line list before the library has set the client up. It now
 uses `httpRequest().setAgent()`, the accessor the library provides for exactly
 this, which stores a pointer and lets the library add the line inside its own
 sequence. Same header on the wire, no out-of-order mutation of the list that
-the fault occurs in. Whether that is the cause is not yet known.
+the fault occurs in. It was not the cause — see the root cause at the top of
+this section — but it is the accessor the library intends, and it stays.
 
 #### Getting the library to say where it dies
 

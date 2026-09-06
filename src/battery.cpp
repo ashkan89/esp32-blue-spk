@@ -245,8 +245,13 @@ bool battery_begin() {
   // 11 dB attenuation gives a usable span of roughly 0.15-2.45 V at the pin,
   // which is where a 2:1 divider on a single cell lands. 12 bits is the ESP32's
   // maximum and costs nothing.
-  analogSetPinAttenuation(PIN_BATTERY_SENSE, ADC_11db);
   analogReadResolution(12);
+  // Arduino core 3.x attaches a pin to the ADC on its first analogRead(), and
+  // analogSetPinAttenuation() refuses -- with an [E] line at every boot -- to
+  // touch a pin that has not been attached yet. One throwaway conversion
+  // attaches it; the attenuation set next is what every later reading uses.
+  (void)analogRead(PIN_BATTERY_SENSE);
+  analogSetPinAttenuation(PIN_BATTERY_SENSE, ADC_11db);
 #endif
 #if PIN_BATTERY_CHARGING >= 0
   pinMode(PIN_BATTERY_CHARGING, INPUT);

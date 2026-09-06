@@ -38,6 +38,8 @@
 #include <lwip/tcpip.h>
 
 #include "app_config.h"
+#include "dlna.h"
+#include "net_radio.h"
 
 namespace {
 
@@ -63,6 +65,7 @@ const uint16_t HEADROOM_REPORT = 4096;
 
 const char *volatile mark = "boot";
 TaskHandle_t loopTask = nullptr;
+volatile uint32_t loopTicks = 0;
 volatile bool reported = false;
 uint16_t headroomLow = 0xFFFF;
 
@@ -121,6 +124,15 @@ struct Census {
   bool truncated;      ///< a list did not end where it should have
   void *badState;      ///< a TIME-WAIT entry whose state is not TIME_WAIT
   int badStateValue;
+  /*
+   * Who holds the TIME-WAIT entries, by local port. A slot is only in that
+   * state because THIS end closed first, so the local port says which server
+   * or client here did the closing: the renderer, the dashboard, or one of
+   * this firmware's own outbound connections (an ephemeral port).
+   */
+  int twRenderer;
+  int twDashboard;
+  int twOutbound;
 };
 
 /*
@@ -132,7 +144,7 @@ struct Census {
  * struct and are printed after the lock is dropped.
  */
 Census pcbCensus() {
-  Census c = {0, 0, 0, false, nullptr, 0};
+  Census c = {0, 0, 0, false, nullptr, 0, 0, 0, 0};
 
   LOCK_TCPIP_CORE();
   for (struct tcp_pcb *pcb = tcp_active_pcbs; pcb; pcb = pcb->next) {
@@ -148,6 +160,9 @@ Census pcbCensus() {
       c.badState = (void *)pcb;
       c.badStateValue = (int)pcb->state;
     }
+    if (pcb->local_port == DLNA_PORT) c.twRenderer++;
+    else if (pcb->local_port == 80) c.twDashboard++;
+    else c.twOutbound++;
   }
   for (struct tcp_pcb *pcb = tcp_bound_pcbs; pcb; pcb = pcb->next) {
     if (++c.bound > PCB_WALK_MAX) { c.truncated = true; break; }
@@ -164,9 +179,14 @@ Census pcbCensus() {
  * crash about to happen. The second is running out of PCBs: this build has
  * MEMP_NUM_TCP_PCB = 16 and TCP_MSL = 60 s, so every connection this firmware
  * closes actively holds one of those sixteen slots for two minutes afterwards
- * -- and the renderer closes one per control request, opens and closes one per
- * event notification, and the dashboard polls on top of that. Whether that
- * ceiling is being hit is a number, not an opinion, so here is the number.
+ * -- and the dashboard polls on top of whatever the renderer is doing. At the
+ * ceiling lwIP does not refuse the next connection; tcp_alloc() evicts the
+ * oldest TIME-WAIT entry (memp.c enforces MEMP_NUM_TCP_PCB even though the
+ * pool is malloc-backed). So this is hygiene rather than a failure, but a slot
+ * pinned for two minutes by a request that took two milliseconds is the wrong
+ * way round, and the renderer now waits for the controller to hang up first
+ * (see the drain table in dlna.cpp). Whether the ceiling is still being
+ * reached is a number, not an opinion, so here is the number.
  */
 void reportPcbs(const char *where) {
   const Census c = pcbCensus();
@@ -200,9 +220,13 @@ void reportPcbs(const char *where) {
   if (total >= MEMP_NUM_TCP_PCB - 2 && total != lastTotal) {
     lastTotal = total;
     LOGF("[heap] TCP PCBs: %d active + %d time-wait = %d of %d. Near the "
-         "ceiling; new connections will start failing. While: %s\n",
+         "ceiling: lwIP will evict the oldest TIME-WAIT entry for the next "
+         "connection. While: %s\n",
          c.active, c.timeWait, total, (int)MEMP_NUM_TCP_PCB,
          where ? where : "(unknown)");
+    LOGF("[heap]   time-wait held by: renderer %d, dashboard %d, "
+         "this firmware's own outbound connections %d\n",
+         c.twRenderer, c.twDashboard, c.twOutbound);
     LOGFLUSH();
   }
 }
@@ -228,12 +252,82 @@ bool check(const char *where) {
   return false;
 }
 
+/*
+ * The loop() starvation detector.
+ *
+ * Found the hard way: the first DLNA track that got past the header bug opened,
+ * filled its buffer, and then the console, the dashboard and the renderer all
+ * went silent for the whole track while the board still answered ping. This
+ * task is on the other core, so it could still say what it saw: loopTask
+ * alternating between ready and blocked without ever reaching the top of
+ * loop(), the radio task running, the stream healthy. That shape -- blocked,
+ * not starved outright -- is a wait inside one loop() pass, and it was the
+ * announcement player writing its clip into the I2S channel the decoder task
+ * had just started saturating at a higher priority. The report below prints
+ * both tasks' states and the radio's figures because that is what told the
+ * two apart.
+ */
+const uint32_t STALL_MS = 3000;
+const uint32_t STALL_REPORT_MS = 5000;
+uint32_t loopChangedAt;
+
+const char *radioStateName(RadioState s) {
+  switch (s) {
+    case RADIO_IDLE: return "idle";
+    case RADIO_CONNECTING: return "connecting";
+    case RADIO_BUFFERING: return "buffering";
+    case RADIO_PLAYING: return "playing";
+    case RADIO_RECONNECTING: return "reconnecting";
+    case RADIO_ERROR: return "error";
+    default: return "?";
+  }
+}
+
+void watchLoop(const char *where) {
+  static uint32_t seenTicks;
+  static uint32_t reportedAt;
+  static bool stalled;
+  const uint32_t now = millis();
+  const uint32_t ticks = loopTicks;
+  if (ticks != seenTicks) {
+    seenTicks = ticks;
+    loopChangedAt = now;
+    if (stalled) {
+      stalled = false;
+      LOGLN("[heap] loop() is running again");
+    }
+    return;
+  }
+  if ((uint32_t)(now - loopChangedAt) < STALL_MS) return;
+  if (stalled && (uint32_t)(now - reportedAt) < STALL_REPORT_MS) return;
+  stalled = true;
+  reportedAt = now;
+
+  LOGF("\n[heap] *** loop() has not run for %u s *** last mark: %s\n",
+       (unsigned)((now - loopChangedAt) / 1000), where ? where : "(unknown)");
+  if (loopTask) {
+    LOGF("[heap] loopTask: state %d, headroom %u bytes "
+         "(0 running, 1 ready, 2 blocked, 3 suspended)\n",
+         (int)eTaskGetState(loopTask),
+         (unsigned)(uxTaskGetStackHighWaterMark(loopTask) * sizeof(StackType_t)));
+  }
+  TaskHandle_t radio = xTaskGetHandle("radio");
+  if (radio) LOGF("[heap] radio task: state %d\n", (int)eTaskGetState(radio));
+  RadioStatus r;
+  net_radio_snapshot(&r);
+  LOGF("[heap] radio: %s, %u bytes in, buffer %u%%, %u underruns%s%s\n",
+       radioStateName(r.state), (unsigned)r.bytes, (unsigned)r.bufferPercent,
+       (unsigned)r.underruns, r.error[0] ? ", error: " : "", r.error);
+  LOGFLUSH();
+}
+
 void monitorTask(void *) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(INTERVAL_MS));
 
     check(mark);
     reportPcbs(mark);
+    watchLoop(mark);
 
     if (!loopTask) continue;
     const UBaseType_t words = uxTaskGetStackHighWaterMark(loopTask);
@@ -251,6 +345,8 @@ void monitorTask(void *) {
 
 void heap_guard_mark(const char *where) { mark = where; }
 
+void heap_guard_loop_tick() { loopTicks = loopTicks + 1; }
+
 bool heap_guard_check(const char *where) { return check(where); }
 
 void heap_guard_begin() {
@@ -260,6 +356,7 @@ void heap_guard_begin() {
    * loopTaskHandle global, which is not declared in any header.
    */
   loopTask = xTaskGetCurrentTaskHandle();
+  loopChangedAt = millis();
 
   /*
    * Priority 5, on core 0.

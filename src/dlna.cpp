@@ -25,6 +25,12 @@
  * REQUEST_TIMEOUT_MS is dropped, a body larger than REQUEST_BODY_MAX is
  * refused, and at most one NOTIFY is sent per loop pass. Nothing in this file
  * may stall the audio path, and the audio path never calls into it.
+ *
+ * Connections are persistent, as HTTP/1.1 controllers expect: a connection is
+ * kept after its response and the next request on it is served there, and it
+ * is closed when the peer closes it or after a few seconds idle. That is what
+ * keeps this end out of TIME-WAIT -- the side that closes first sits there for
+ * two minutes, and this build has sixteen TCP PCBs in total.
  */
 
 #include "dlna.h"
@@ -38,6 +44,8 @@
 #include <WiFiUdp.h>
 #include <esp_mac.h>
 #include <esp_random.h>
+#include <errno.h>
+#include <lwip/sockets.h>
 #include <new>
 #include <string.h>
 
@@ -199,6 +207,59 @@ struct PendingReply {
   char st[80];
 };
 PendingReply pending[8];
+
+/*
+ * Open connections between requests: HTTP/1.1 persistent connections.
+ *
+ * TCP puts whichever side closes FIRST into TIME-WAIT for 2 * TCP_MSL -- two
+ * minutes on this build -- and this IDF caps TCP PCBs at sixteen
+ * (CONFIG_LWIP_MAX_ACTIVE_TCP). A controller discovering the renderer makes a
+ * dozen short requests in a few seconds and then polls it once a second for as
+ * long as it is playing. Answering each with "Connection: close" and calling
+ * stop() made this firmware the active closer every time, and the heap guard
+ * duly reported "15 of 16 PCBs in TIME-WAIT" while a phone was doing nothing
+ * more than looking at the speaker. lwIP evicts the oldest TIME-WAIT entry
+ * when the seventeenth connection arrives, so nothing failed outright -- but a
+ * slot pinned for two minutes by a request that took two milliseconds is the
+ * wrong way round.
+ *
+ * The first attempt at this parked each answered connection for a second and
+ * waited for the controller's FIN, so that the close would be the passive one.
+ * The guard's port census then showed every TIME-WAIT entry still belonged to
+ * the renderer: the Android controller does not hang up after a response, it
+ * keeps the connection and sends its next request down it, which is what
+ * HTTP/1.1 says a client may do. Discarding what arrived and closing after a
+ * second was therefore worse than the original, not better.
+ *
+ * So the server now does what the client expects. A connection stays in this
+ * table after its response, and a request that arrives on it is served there;
+ * it is closed when the peer closes it (the passive close, no TIME-WAIT) or
+ * when it has been idle for IDLE_MS. A controller polling once a second lives
+ * on one connection instead of costing a PCB per poll. Outbound NOTIFY sockets
+ * sit in the same table with `serve` false: the controller's "200 OK" is read
+ * and discarded on the way to its FIN, and it too is closed by idleness if
+ * the controller never sends one.
+ *
+ * Cost: up to PARKED_MAX sockets held open, each with the client's ~1.4 kB
+ * receive buffer. When the table is full the extra connection is closed after
+ * its response, exactly as before. A NetworkClient copy shares the socket
+ * handle, so parking a copy keeps the socket open until stop() is called on it.
+ *
+ * Nothing here is served for longer than one request per pass, and a parked
+ * connection with nothing on it costs one non-blocking peek per pass.
+ */
+const uint32_t IDLE_MS = 4000;
+const size_t PARKED_MAX = 6;
+
+struct Parked {
+  bool used;
+  bool serve;  ///< requests arriving here are served; false = an outbound NOTIFY
+  NetworkClient client;
+  uint32_t deadline;
+};
+Parked parked[PARKED_MAX];
+
+void serveRequest(NetworkClient &client);
 
 // =========================================================== renderer state ==
 
@@ -368,6 +429,85 @@ bool uriAcceptable(const char *uri) {
   const char *at = strchr(authority, '@');
   if (at && (!slash || at < slash)) return false;
   return true;
+}
+
+// ============================================== persistent connections ====
+
+/// Keeps a connection open after its response so the peer can reuse it, or
+/// close it. Falls back to an immediate close when the table is full or the
+/// peer has already gone.
+void parkClient(NetworkClient &client, bool serve) {
+  if (!client.connected()) {
+    client.stop();
+    return;
+  }
+  for (auto &p : parked) {
+    if (p.used) continue;
+    p.used = true;
+    p.serve = serve;
+    p.client = client;
+    p.deadline = millis() + IDLE_MS;
+    return;
+  }
+  client.stop();
+}
+
+/*
+ * One pass over the parked connections: serve what has arrived, close what
+ * the peer has closed or left idle. At most one request is served per pass so
+ * a chatty controller cannot hold loop() for longer than one request.
+ */
+void serviceParked() {
+  const uint32_t now = millis();
+  bool servedOne = false;
+  for (auto &p : parked) {
+    if (!p.used) continue;
+    bool close = (int32_t)(now - p.deadline) >= 0;
+    if (!close) {
+      const int fd = p.client.fd();
+      if (fd < 0) {
+        close = true;
+      } else if (p.serve) {
+        // connected() peeks: false means the peer sent FIN and nothing is
+        // left to read, which makes our close the passive one.
+        if (!p.client.connected()) {
+          close = true;
+        } else if (!servedOne && p.client.available() > 0) {
+          servedOne = true;
+          serveRequest(p.client);
+          if (!p.client.connected()) close = true;
+          else p.deadline = millis() + IDLE_MS;
+        }
+      } else {
+        // An outbound NOTIFY: whatever the controller answers is discarded.
+        // What we are waiting for is the zero-length read that means FIN.
+        uint8_t sink[64];
+        for (int i = 0; i < 4; i++) {
+          const int n = recv(fd, sink, sizeof(sink), MSG_DONTWAIT);
+          if (n == 0) {
+            close = true;
+            break;
+          }
+          if (n < 0) {
+            if (errno != EWOULDBLOCK && errno != EAGAIN) close = true;
+            break;
+          }
+        }
+      }
+    }
+    if (close) {
+      p.client.stop();
+      p.used = false;
+    }
+  }
+}
+
+/// Closes everything parked, now. For dlna_stop().
+void dropParked() {
+  for (auto &p : parked) {
+    if (p.used) p.client.stop();
+    p.used = false;
+  }
 }
 
 // ============================================================== identity ====
@@ -546,7 +686,14 @@ void sendNotify(Subscription &s) {
   if (bodyLen <= 0) return;
 
   NetworkClient client;
-  client.setTimeout(2);
+  // Milliseconds, not seconds: NetworkClient has no setTimeout() of its own on
+  // this core, so setTimeout() is Stream's per-read timeout. The connect has
+  // its own, and it is short on purpose: a LAN connect completes in tens of
+  // milliseconds, and a controller that has gone away -- or a phone that is
+  // resetting inbound connections while it dozes, which the stall detector
+  // caught costing 3 s for two subscriptions -- costs loop() at most this much.
+  client.setConnectionTimeout(500);
+  client.setTimeout(200);
   if (!client.connect(host, cbPort)) return;
   client.printf(
       "NOTIFY %s HTTP/1.1\r\nHOST: %s:%u\r\nCONTENT-TYPE: text/xml; "
@@ -554,7 +701,9 @@ void sendNotify(Subscription &s) {
       "%s\r\nSEQ: %u\r\nCONTENT-LENGTH: %d\r\nConnection: close\r\n\r\n",
       path, host, (unsigned)cbPort, s.sid, (unsigned)s.seq++, bodyLen);
   client.write((const uint8_t *)body, (size_t)bodyLen);
-  client.stop();
+  // Not stop(): the controller answers 200 OK and hangs up, and letting it go
+  // first keeps this end out of TIME-WAIT. See the connection table.
+  parkClient(client, /*serve=*/false);
 }
 
 /// Something a subscriber cares about changed. Flags them; loop() does the
@@ -584,7 +733,7 @@ void sendResponse(NetworkClient &client, int code, const char *contentType,
   if (contentType) client.printf("CONTENT-TYPE: %s\r\n", contentType);
   client.printf("CONTENT-LENGTH: %u\r\n", (unsigned)len);
   client.printf("SERVER: %s\r\n", serverHeader);
-  client.print("EXT:\r\nConnection: close\r\n");
+  client.print("EXT:\r\nConnection: keep-alive\r\n");
   if (extraHeaders) client.print(extraHeaders);
   client.print("\r\n");
   if (len) client.write((const uint8_t *)body, len);
@@ -695,7 +844,7 @@ void serveScpd(NetworkClient &client, const char *actions,
   client.print("CONTENT-TYPE: text/xml; charset=\"utf-8\"\r\n");
   client.printf("CONTENT-LENGTH: %u\r\n", (unsigned)total);
   client.printf("SERVER: %s\r\n", serverHeader);
-  client.print("Connection: close\r\n\r\n");
+  client.print("Connection: keep-alive\r\n\r\n");
   client.print(FPSTR(SCPD_HEAD));
   client.print(actions);
   client.print("</actionList><serviceStateTable>");
@@ -1245,11 +1394,19 @@ const char *soapActionName(const char *header) {
   return name;
 }
 
-void serviceHttp() {
+/*
+ * One request on an open connection, served. Used for a connection that has
+ * just been accepted and for one that was parked and has spoken again. The
+ * connection is left open on return unless the request did not parse, in
+ * which case it is closed here and the caller sees connected() false.
+ */
+void serveRequest(NetworkClient &client) {
   heap_guard_mark("dlna: serving a control request");
-  NetworkClient client = http->accept();
-  if (!client) return;
-  client.setTimeout(1);  // seconds, on this class -- see the note above
+  // Milliseconds: this is Stream's per-read timeout, not a socket option (the
+  // previous value here was 1, believed to be seconds, so a header split across
+  // two segments was cut off after a millisecond). The deadline inside
+  // readRequest() bounds the request as a whole.
+  client.setTimeout(100);
 
   Request req;
   char *body = scr->body;
@@ -1300,7 +1457,15 @@ void serviceHttp() {
   }
 
   client.flush();
-  client.stop();
+}
+
+/// Accepts one new connection per pass and serves its first request; it is
+/// then parked for whatever the controller sends next.
+void serviceHttp() {
+  NetworkClient client = http->accept();
+  if (!client) return;
+  serveRequest(client);
+  parkClient(client, /*serve=*/true);
 }
 
 // ==================================================================== SSDP ===
@@ -1518,6 +1683,7 @@ void dlna_stop() {
   announce(false);
   for (auto &s : subs) s.used = false;
   for (auto &p : pending) p.used = false;
+  dropParked();
   ssdp.stop();
   if (http) {
     http->end();
@@ -1548,6 +1714,7 @@ void dlna_loop() {
   serviceSsdp();
   servicePending();
   serviceHttp();
+  serviceParked();
   expireSubscriptions();
 
   // Re-announce before controllers' caches expire, or they quietly forget us.

@@ -129,6 +129,18 @@ void voice_set_sample_rate(uint32_t hz);
 size_t voice_render(int16_t *interleaved, size_t frames);
 
 /*
+ * The loop path giving a clip up mid-way.
+ *
+ * Called when the DAC becomes somebody else's between two chunks -- a stream
+ * that has just started decoding. The clip is not dropped: ownership goes back
+ * to nobody, and voice_mix() claims it on the audio task's next buffer and
+ * carries on from the same sample, ducked under the music. Without this the
+ * loop path keeps writing its chunks into an I2S channel that a higher-priority
+ * task is saturating, and loop() is gone for the length of the track.
+ */
+void voice_yield_to_mixer();
+
+/*
  * Mixes the current announcement into a buffer that already has music in it,
  * ducking the music underneath.
  *

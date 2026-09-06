@@ -204,6 +204,21 @@ void net_radio_loop();
 /// consults for the network path.
 bool net_radio_active();
 
+/*
+ * True from the moment a stream is asked for until it is stopped or gives up:
+ * connecting, buffering, playing and reconnecting alike.
+ *
+ * This is the question the Arduino task has to ask before writing anything to
+ * I2S itself. net_radio_active() answers "is audio flowing", which is the
+ * wrong question there: the decoder task starts writing the instant it has
+ * audio, at a higher priority on the same core, and a clip that loop() began
+ * writing while the radio was still connecting is then stuck behind it -- a
+ * chunk at a time, for the whole of the track. The first DLNA push that got
+ * past the header bug spent its entire 3 minutes with the console, the
+ * dashboard and the renderer dark for exactly that reason.
+ */
+bool net_radio_owns_dac();
+
 /// A consistent copy of everything above. Safe from any task.
 void net_radio_snapshot(RadioStatus *out);
 
@@ -321,6 +336,7 @@ inline bool net_radio_begin(void *) { return false; }
 inline bool net_radio_running() { return false; }
 inline void net_radio_loop() {}
 inline bool net_radio_active() { return false; }
+inline bool net_radio_owns_dac() { return false; }
 inline void net_radio_snapshot(RadioStatus *out) {
   if (!out) return;
   *out = RadioStatus{};

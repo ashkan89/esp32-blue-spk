@@ -277,8 +277,11 @@ static bool radio_command(const char *line);
 
 #if CONSOLE_ENABLED
 static void poll_console() {
-  static char buf[64];
-  static uint8_t len;
+  // Sized for "station <url>": the radio accepts addresses up to
+  // RADIO_PLAY_URL_MAX, and a UPnP media server's URL with its query string
+  // did not fit the 64 bytes this used to be.
+  static char buf[RADIO_PLAY_URL_MAX + 16];
+  static uint16_t len;
 
   while (Serial.available()) {
     const char c = (char)Serial.read();
@@ -572,11 +575,20 @@ static void service_voice() {
 
   static int16_t frames[TONE_CHUNK_FRAMES * 2];
   size_t written;
-  while ((written = voice_render(frames, TONE_CHUNK_FRAMES)) > 0) {
+  /*
+   * The DAC is asked about before every chunk, not just once at the top. A
+   * stream that starts decoding halfway through an announcement takes the
+   * channel at a higher priority on this core, and a write from here then
+   * waits behind it -- for the next chunk, and the next, for as long as the
+   * music lasts. So the moment the channel is spoken for, the clip is handed
+   * to the mixer on the audio task, which finishes it ducked under the music.
+   */
+  while (!dac_busy() && (written = voice_render(frames, TONE_CHUNK_FRAMES)) > 0) {
     audio_probe_feed((const Frame *)frames, (uint16_t)written);
     i2s.write((const uint8_t *)frames, written * 4);
     status_led_tick();
   }
+  if (dac_busy()) voice_yield_to_mixer();
 }
 
 /// Plays whatever a callback queued. Called from loop(), never from the
@@ -732,7 +744,7 @@ static bool dac_busy() {
    * but interleave samples with it. The comment above this function has always
    * said so; this is the line that makes it true.
    */
-  if (net_radio_active()) return true;
+  if (net_radio_owns_dac()) return true;
   /*
    * The DFPlayer does not share the I2S channel -- its audio is analog and joins
    * further downstream -- so a melody here cannot interleave samples with it the
@@ -1547,6 +1559,7 @@ void setup() {
 }
 
 void loop() {
+  heap_guard_loop_tick();
   // A2DP, I2S and the display all run in their own FreeRTOS tasks. What is left
   // here is the status LED, the melodies a callback queued, the serial log and
   // the console.
