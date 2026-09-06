@@ -227,11 +227,12 @@ void print_report() {
                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024u),
                     (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) /
                                1024u));
-      if (b.psram_physical_bytes > b.psram_mapped_bytes + (256u * 1024u))
-        LOGF("              the %u MB above the window needs the banked himem "
-                      "API and is not malloc memory\n",
-                      (unsigned)((b.psram_physical_bytes - b.psram_mapped_bytes) /
-                                 (1024u * 1024u)));
+      if (b.himem_physical_bytes)
+        LOGF("              %u KB above the 4 MiB window: himem only, %u KB "
+                      "free, %u KB map window\n",
+                      (unsigned)(b.himem_physical_bytes / 1024u),
+                      (unsigned)(b.himem_free_bytes / 1024u),
+                      (unsigned)(b.himem_window_bytes / 1024u));
     } else {
       LOGF("  psram       none%s\n",
                     BOARD_EXPECTS_PSRAM

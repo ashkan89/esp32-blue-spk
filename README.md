@@ -607,6 +607,60 @@ reason appears in the boot log, in `diag`, and at the top of
 `/api/capabilities`, and the firmware carries on with everything that still
 works. A speaker that will not boot cannot tell anybody why it will not boot.
 
+### The 8 MB question: why the log says 4
+
+Your board reports this, and it is correct:
+
+```
+[board] psram: 8 MB physical, 4096 KB mapped into the heap, 4031 KB largest block
+[board] psram: 4096 KB of it sits above the 4 MiB data-bus window and is
+        reachable only through himem (4096 KB free, 256 KB of address space
+        reserved to map it). Nothing here spends it.
+```
+
+**A classic ESP32 cannot address more than 4 MiB of external RAM as ordinary
+memory.** The data bus has a fixed window at `0x3F800000`–`0x3FBFFFFF`, four
+mebibytes wide, and that is silicon. No build flag, sdkconfig option or
+allocator setting moves it. An 8 MB part is not a mistake — it is simply that
+half of it needs a different access method.
+
+That method is **himem**: `esp_himem_alloc()` reserves physical banks and
+`esp_himem_map()` maps a 32 KB-aligned range into a slice of the low window. It
+is real memory and it works, with three consequences:
+
+1. Every access needs an explicit map/unmap. There are no pointers into it that
+   stay valid.
+2. The mapping window is subtracted from the ordinary heap — 256 KB here. Using
+   himem is a **trade**, not a free win.
+3. Nothing with a deadline can live there. It is a bulk store.
+
+So the firmware reports all three numbers — physical, free, and window — in the
+boot log, in `diag`, and in `/api/capabilities` under `board.psram`, and does
+not spend it. There is currently nothing in this firmware whose shape fits: the
+largest thing that wants external RAM is the radio's jitter buffer, and that
+belongs in directly addressable memory because a decoder reads from it
+continuously.
+
+If a use appears that genuinely wants megabytes of bulk storage — a live-radio
+timeshift buffer is the obvious candidate — himem is where it goes, and the
+reporting above is already in place to size it.
+
+### What the mapped 4 MiB is actually used for
+
+| | |
+|---|---|
+| Internet radio jitter buffer | up to **512 kB** — about half a minute of a 128 kbps stream |
+| UPnP renderer working buffers | ~10 kB (request body, XML, SOAP, SSDP) |
+
+512 kB rather than four megabytes, and that is a decision rather than an
+oversight: past roughly half a minute a domestic connection's problems have
+stopped being pauses and started being outages, and an outage is better
+reported than buffered through. Spending the rest here would use the memory
+without improving anything.
+
+The renderer's buffers are in PSRAM for a reason that is not about capacity —
+see below.
+
 ### The IRAM problem, and what was done about it
 
 Worth knowing before adding anything to this firmware, and worth reading in full
@@ -868,12 +922,12 @@ $ pio run -e esp32_wroom_32d_16mb
 iram_reclaim: linking newlib from ROM (esp32.rom.libc-funcs.ld)
 iram_reclaim: keeping libc_a-lcltime_r in IRAM -- cache-disabled code references localtime_r
 iram_reclaim: moved 19 newlib calendar member(s) out of IRAM, kept 1 back
-RAM:   [===       ]  26.5% (used 86996 bytes from 327680 bytes)
-Flash: [====      ]  41.0% (used 2688652 bytes from 6553600 bytes)
+RAM:   [===       ]  26.6% (used 87020 bytes from 327680 bytes)
+Flash: [====      ]  41.0% (used 2689860 bytes from 6553600 bytes)
 
 $ pio run -e esp32_wrover_e_n16r8
-RAM:   [===       ]  28.3% (used 92572 bytes from 327680 bytes)
-Flash: [====      ]  44.5% (used 2917408 bytes from 6553600 bytes)
+RAM:   [===       ]  28.3% (used 92596 bytes from 327680 bytes)
+Flash: [====      ]  44.5% (used 2918312 bytes from 6553600 bytes)
 ```
 
 All seven environments — the two targets, their four release variants and the
@@ -949,7 +1003,7 @@ every subsystem by hand, and prints the full `diag` report.
 | IDF logging | `CORE_DEBUG_LEVEL=1` | `CORE_DEBUG_LEVEL=0` |
 | `assert()` | active | `NDEBUG` |
 | Flash clock | 40 MHz DIO | **80 MHz** DIO |
-| Firmware image | 2,688,652 B | **2,601,056 B** |
+| Firmware image | 2,689,860 B | **2,601,840 B** |
 
 You can check the last claim rather than believing it:
 
@@ -1071,8 +1125,8 @@ carefully:
 ```sh
 $ python scripts/test_partitions.py
 ...
-image  esp32_wroom_32d_16mb         2723616 bytes   41.6% of slot  ok
-image  esp32_wrover_e_n16r8         2962768 bytes   45.2% of slot  ok
+image  esp32_wroom_32d_16mb         2724816 bytes   41.6% of slot  ok
+image  esp32_wrover_e_n16r8         2963536 bytes   45.2% of slot  ok
 All partition checks passed.
 ```
 
@@ -2815,6 +2869,49 @@ The service descriptions list only the actions above. Padding them out with
 actions that would return "not implemented" is how a Seek control appears on a
 live stream.
 
+### The loop task's stack, and the renderer's buffers
+
+The first version of the renderer took a WROVER down:
+
+```
+Guru Meditation Error: Core 1 panic'ed (Unhandled debug exception).
+Debug exception reason: Stack canary watchpoint triggered (loopTask)
+```
+
+Everything in `dlna.cpp` runs on the Arduino **loop task**, whose stack is 8 kB
+by default and which is shared with the melodies, the spoken announcements, the
+battery gauge, the clock, the web server, the DFPlayer poll, the radio, the
+alarms and the update check. `sendNotify()` alone had 2.5 kB of `char` arrays in
+a single frame, and serving a SOAP action nested another 2 kB beneath it.
+
+The backtrace pointed at the startup update check, which had nothing to do with
+it. That is what a stack canary does: it fires when the margin runs out, naming
+whatever happened to be deepest at that moment rather than whatever spent the
+stack. It is a genuinely misleading failure and worth recognising on sight.
+
+Two changes, in order of which one is the fix:
+
+1. **The buffers moved to external RAM.** One `Scratch` block, allocated when
+   the renderer starts and released when it stops, carved into named regions
+   with the aliasing rules written down beside them. This is also the answer to
+   "why fit 8 MB of PSRAM and then put kilobytes on an 8 kB stack".
+
+2. **`SET_LOOP_TASK_STACK_SIZE(12288)`.** The margin behind the fix. A stack
+   that is exactly large enough is the same shape of problem as an IRAM segment
+   with 684 bytes free, and this project has already had one of those. It costs
+   4 kB of internal DRAM, which both targets have.
+
+And so it is visible the next time rather than fatal, `loop()` now checks its own
+high-water mark every five seconds and warns once per threshold crossing when it
+drops under 1 kB:
+
+```
+[loop] stack is down to 812 bytes free at its worst. Something on the loop task
+is deep; `diag` lists the tasks.
+```
+
+`diag` prints the same figure under **task stacks** at any time.
+
 ### Why it has its own HTTP server
 
 The dashboard's `WebServer` cannot serve this. UPnP eventing uses `SUBSCRIBE`,
@@ -2825,7 +2922,8 @@ against a fixed table of methods and drops the connection on anything else
 So the renderer runs a small HTTP/1.1 server of its own on port **49494**, which
 also keeps unauthenticated UPnP traffic off the authenticated dashboard. It
 costs one listening socket and one UDP socket, both serviced from `loop()` — no
-extra task, no extra stack. Every operation is bounded: a request that does not
+extra task, and its working buffers live in external RAM rather than on that
+task's stack, for the reason the section above is about. Every operation is bounded: a request that does not
 arrive within 3 s is dropped, a body over 4 kB is refused, and at most one
 `NOTIFY` is sent per loop pass so a controller that walked away cannot stall
 anything with a connect timeout.

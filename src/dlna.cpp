@@ -118,7 +118,51 @@ uint32_t nextStartAttempt;
  * the same argument net_radio.cpp makes about its jitter buffer, and it lands
  * the same way. Allocated when the renderer starts, released when it stops.
  */
-char *requestBody;
+/*
+ * Every working buffer this module needs, in one block in external RAM.
+ *
+ * These were locals. That was wrong, and it was wrong in a way that took a
+ * board down: everything here runs on the Arduino loop task, whose stack is
+ * 8 kB and is shared with the melodies, the DFPlayer poll, the web server and
+ * the update check. sendNotify() alone had 2.5 kB of char arrays in one frame,
+ * and serving a SOAP action nested another 2 kB under it. The result was a
+ * stack canary panic on loopTask -- not at the moment the renderer did
+ * anything, but at whatever happened to be deepest when the margin ran out,
+ * which is why the backtrace pointed at the update check instead.
+ *
+ * One PSRAM block instead, carved into named regions. This is also the answer
+ * to "why fit 8 MB of external RAM and then put kilobytes on an 8 kB stack".
+ *
+ * ALIASING RULES, because these are shared and the compiler will not check:
+ *
+ *   body      the request body. Read by readRequest(), then read by the
+ *             handler. Nothing else may touch it during a request.
+ *   xml       intermediate XML: the event document before escaping, the
+ *             DIDL-Lite metadata being searched.
+ *   args      the SOAP argument fragment a handler builds, and the escaped
+ *             event document. Never live at the same time as `xml`'s content
+ *             is still needed -- sendNotify() builds xml then escapes into
+ *             args, and reads neither afterwards.
+ *   out       the finished response body. Written by sendSoapOk/Fault and by
+ *             serveDeviceDescription, always LAST, always reading `args`.
+ *   ssdp      the received datagram and the datagram being sent. serviceSsdp()
+ *             and servicePending() are called in sequence from dlna_loop(),
+ *             never nested, and serviceSsdp() is finished with the packet
+ *             before it queues anything.
+ *   uri       one escaped URI. Used inside a single handler at a time.
+ *
+ * Nothing here is re-entrant, and nothing needs to be: dlna_loop() is the only
+ * caller and it runs on one task.
+ */
+struct Scratch {
+  char body[REQUEST_BODY_MAX];
+  char out[2048];
+  char args[1200];
+  char xml[1200];
+  char ssdp[700];
+  char uri[DLNA_URI_MAX * 2];
+};
+Scratch *scr;
 
 /*
  * M-SEARCH answers that are not due yet.
@@ -441,8 +485,8 @@ void sendNotify(Subscription &s) {
   host[hostLen] = '\0';
   const char *path = slash ? slash : "/";
 
-  char inner[512];
-  char escaped[900];
+  char *inner = scr->xml;
+  char *escaped = scr->args;
   if (s.avTransport) {
     /*
      * The URI is escaped twice on the way out, and that is correct rather than
@@ -451,9 +495,9 @@ void sendNotify(Subscription &s) {
      * of an element. Getting this wrong is why a controller shows an empty
      * "now playing" next to audio it can hear.
      */
-    char uri[DLNA_URI_MAX * 2];
-    xmlEscape(uri, sizeof(uri), currentUri);
-    snprintf(inner, sizeof(inner),
+    char *uri = scr->uri;
+    xmlEscape(uri, sizeof(scr->uri), currentUri);
+    snprintf(inner, sizeof(scr->xml),
              "<Event xmlns=\"urn:schemas-upnp-org:metadata-1-0/AVT/\">"
              "<InstanceID val=\"0\">"
              "<TransportState val=\"%s\"/>"
@@ -467,7 +511,7 @@ void sendNotify(Subscription &s) {
              transportName(currentTransport()), uri, uri,
              currentUri[0] ? 1 : 0, currentUri[0] ? 1 : 0);
   } else {
-    snprintf(inner, sizeof(inner),
+    snprintf(inner, sizeof(scr->xml),
              "<Event xmlns=\"urn:schemas-upnp-org:metadata-1-0/RCS/\">"
              "<InstanceID val=\"0\">"
              "<Volume channel=\"Master\" val=\"%u\"/>"
@@ -475,11 +519,11 @@ void sendNotify(Subscription &s) {
              "</InstanceID></Event>",
              (unsigned)toUpnpVolume(net_radio_volume()), muted ? 1 : 0);
   }
-  xmlEscape(escaped, sizeof(escaped), inner);
+  xmlEscape(escaped, sizeof(scr->args), inner);
 
-  char body[1100];
+  char *body = scr->out;
   const int bodyLen = snprintf(
-      body, sizeof(body),
+      body, sizeof(scr->out),
       "<?xml version=\"1.0\"?>"
       "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
       "<e:property><LastChange>%s</LastChange></e:property>"
@@ -536,8 +580,8 @@ void sendResponse(NetworkClient &client, int code, const char *contentType,
 /// number: 402 invalid args, 701 transition not available, 714 unsupported
 /// media, 501 action failed.
 void sendSoapFault(NetworkClient &client, int code, const char *reason) {
-  char body[420];
-  snprintf(body, sizeof(body),
+  char *body = scr->out;
+  snprintf(body, sizeof(scr->out),
            "<?xml version=\"1.0\"?>"
            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
@@ -552,8 +596,8 @@ void sendSoapFault(NetworkClient &client, int code, const char *reason) {
 
 void sendSoapOk(NetworkClient &client, const char *service, const char *action,
                 const char *args) {
-  char body[900];
-  snprintf(body, sizeof(body),
+  char *body = scr->out;
+  snprintf(body, sizeof(scr->out),
            "<?xml version=\"1.0\"?>"
            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
@@ -566,11 +610,11 @@ void sendSoapOk(NetworkClient &client, const char *service, const char *action,
 // ================================================================== XML ======
 
 void serveDeviceDescription(NetworkClient &client) {
-  char name[128];
-  xmlEscape(name, sizeof(name), friendlyName);
-  char body[1500];
+  char *name = scr->args;
+  xmlEscape(name, sizeof(scr->args), friendlyName);
+  char *body = scr->out;
   snprintf(
-      body, sizeof(body),
+      body, sizeof(scr->out),
       "<?xml version=\"1.0\"?>"
       "<root xmlns=\"urn:schemas-upnp-org:device-1-0\" "
       "xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">"
@@ -816,9 +860,9 @@ void handleAvTransport(NetworkClient &client, const char *action,
 
     // The title, if the controller sent DIDL-Lite metadata. Not invented when
     // it did not: the dashboard would rather show the host than a guess.
-    char meta[900];
+    char *meta = scr->xml;
     currentTitle[0] = '\0';
-    if (xmlValue(body, "CurrentURIMetaData", meta, sizeof(meta)) && meta[0]) {
+    if (xmlValue(body, "CurrentURIMetaData", meta, sizeof(scr->xml)) && meta[0]) {
       xmlUnescape(meta);
       char title[DLNA_TITLE_MAX];
       if (xmlValue(meta, "title", title, sizeof(title)))
@@ -868,8 +912,8 @@ void handleAvTransport(NetworkClient &client, const char *action,
   }
 
   if (strcmp(action, "GetTransportInfo") == 0) {
-    char args[220];
-    snprintf(args, sizeof(args),
+    char *args = scr->args;
+    snprintf(args, sizeof(scr->args),
              "<CurrentTransportState>%s</CurrentTransportState>"
              "<CurrentTransportStatus>OK</CurrentTransportStatus>"
              "<CurrentSpeed>1</CurrentSpeed>",
@@ -896,10 +940,10 @@ void handleAvTransport(NetworkClient &client, const char *action,
       elapsed = (millis() - r.playingSince) / 1000;
     char rel[16];
     formatDuration(rel, sizeof(rel), elapsed);
-    char uri[DLNA_URI_MAX * 2];
-    xmlEscape(uri, sizeof(uri), currentUri);
-    char args[820];
-    snprintf(args, sizeof(args),
+    char *uri = scr->uri;
+    xmlEscape(uri, sizeof(scr->uri), currentUri);
+    char *args = scr->args;
+    snprintf(args, sizeof(scr->args),
              "<Track>%d</Track><TrackDuration>0:00:00</TrackDuration>"
              "<TrackMetaData></TrackMetaData><TrackURI>%s</TrackURI>"
              "<RelTime>%s</RelTime><AbsTime>NOT_IMPLEMENTED</AbsTime>"
@@ -910,10 +954,10 @@ void handleAvTransport(NetworkClient &client, const char *action,
   }
 
   if (strcmp(action, "GetMediaInfo") == 0) {
-    char uri[DLNA_URI_MAX * 2];
-    xmlEscape(uri, sizeof(uri), currentUri);
-    char args[820];
-    snprintf(args, sizeof(args),
+    char *uri = scr->uri;
+    xmlEscape(uri, sizeof(scr->uri), currentUri);
+    char *args = scr->args;
+    snprintf(args, sizeof(scr->args),
              "<NrTracks>%d</NrTracks><MediaDuration>0:00:00</MediaDuration>"
              "<CurrentURI>%s</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
              "<NextURI></NextURI><NextURIMetaData></NextURIMetaData>"
@@ -1001,8 +1045,8 @@ void handleRenderingControl(NetworkClient &client, const char *action,
 
 void handleConnectionManager(NetworkClient &client, const char *action) {
   if (strcmp(action, "GetProtocolInfo") == 0) {
-    char args[600];
-    snprintf(args, sizeof(args), "<Source></Source><Sink>%s</Sink>",
+    char *args = scr->args;
+    snprintf(args, sizeof(scr->args), "<Source></Source><Sink>%s</Sink>",
              (const char *)FPSTR(SINK_PROTOCOL_INFO));
     sendSoapOk(client, "ConnectionManager", "GetProtocolInfo", args);
     return;
@@ -1109,6 +1153,12 @@ bool readRequest(NetworkClient &client, Request &req, char *body,
   body[0] = '\0';
 
   const uint32_t deadline = millis() + REQUEST_TIMEOUT_MS;
+  /*
+   * The one large local left in this file, deliberately. 512 bytes is live only
+   * inside this function, a header line has to land somewhere before its name
+   * is known, and putting it in the shared scratch would alias the body buffer
+   * being filled a few lines below.
+   */
   char line[REQUEST_LINE_MAX];
 
   // Request line.
@@ -1187,11 +1237,7 @@ void serviceHttp() {
   client.setTimeout(1);  // seconds, on this class -- see the note above
 
   Request req;
-  char *body = requestBody;
-  if (!body) {
-    client.stop();
-    return;
-  }
+  char *body = scr->body;
   if (!readRequest(client, req, body, REQUEST_BODY_MAX)) {
     client.stop();
     return;
@@ -1281,8 +1327,8 @@ void ssdpRespond(const char *st, const IPAddress &to, uint16_t toPort) {
   if (strcmp(st, uuid) == 0) snprintf(usn, sizeof(usn), "%s", uuid);
   else snprintf(usn, sizeof(usn), "%s::%s", uuid, st);
 
-  char payload[420];
-  snprintf(payload, sizeof(payload),
+  char *payload = scr->ssdp;
+  snprintf(payload, sizeof(scr->ssdp),
            "HTTP/1.1 200 OK\r\n"
            "CACHE-CONTROL: max-age=%u\r\n"
            "EXT:\r\n"
@@ -1299,7 +1345,7 @@ void announce(bool alive) {
   IPAddress group;
   group.fromString(SSDP_MULTICAST);
   char usn[110];
-  char payload[460];
+  char *payload = scr->ssdp;
   const char *nts = alive ? "alive" : "byebye";
 
   const char *nts_targets[] = {uuid, "upnp:rootdevice",
@@ -1310,7 +1356,7 @@ void announce(bool alive) {
   for (const char *nt : nts_targets) {
     if (strcmp(nt, uuid) == 0) snprintf(usn, sizeof(usn), "%s", uuid);
     else snprintf(usn, sizeof(usn), "%s::%s", uuid, nt);
-    snprintf(payload, sizeof(payload),
+    snprintf(payload, sizeof(scr->ssdp),
              "NOTIFY * HTTP/1.1\r\n"
              "HOST: %s:%u\r\n"
              "CACHE-CONTROL: max-age=%u\r\n"
@@ -1333,8 +1379,8 @@ void serviceSsdp() {
   const int size = ssdp.parsePacket();
   if (size <= 0) return;
 
-  char packet[600];
-  const int len = ssdp.read((uint8_t *)packet, sizeof(packet) - 1);
+  char *packet = scr->ssdp;
+  const int len = ssdp.read((uint8_t *)packet, sizeof(scr->ssdp) - 1);
   if (len <= 0) return;
   packet[len] = '\0';
 
@@ -1415,17 +1461,17 @@ bool dlna_begin() {
 
   buildIdentity();
 
-  requestBody = (char *)board_alloc(REQUEST_BODY_MAX, /*allow_internal=*/true);
-  if (!requestBody) {
-    LOGLN("[dlna] no memory for the request buffer");
+  scr = (Scratch *)board_alloc(sizeof(Scratch), /*allow_internal=*/true);
+  if (!scr) {
+    LOGLN("[dlna] no memory for the renderer's working buffers");
     return false;
   }
 
   http = new (std::nothrow) NetworkServer(port);
   if (!http) {
     LOGLN("[dlna] no memory for the renderer's HTTP server");
-    board_free(requestBody);
-    requestBody = nullptr;
+    board_free(scr);
+    scr = nullptr;
     return false;
   }
   http->begin();
@@ -1438,8 +1484,8 @@ bool dlna_begin() {
     http->end();
     delete http;
     http = nullptr;
-    board_free(requestBody);
-    requestBody = nullptr;
+    board_free(scr);
+    scr = nullptr;
     return false;
   }
 
@@ -1463,8 +1509,8 @@ void dlna_stop() {
     delete http;
     http = nullptr;
   }
-  board_free(requestBody);
-  requestBody = nullptr;
+  board_free(scr);
+  scr = nullptr;
   running = false;
   LOGLN("[dlna] renderer stopped");
 }

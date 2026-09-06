@@ -264,6 +264,31 @@ struct BoardCaps {
   /// PSRAM initialised and usable.
   bool psram_ok;
 
+  /*
+   * The half of an 8 MB part that malloc() can never reach, and the window
+   * through which it can be reached instead.
+   *
+   * This is the answer to "I fitted 8 MB, why does it say 4". The classic
+   * ESP32 addresses external RAM through a fixed 4 MiB window in the data bus
+   * at 0x3F800000-0x3FBFFFFF. That is silicon, not configuration: no build flag
+   * moves it, and nothing can make the upper megabytes into ordinary pointers.
+   *
+   * What exists instead is himem -- explicit map/unmap of 32 KB banks into a
+   * reserved slice of the low window. It is real memory and it is usable, but
+   * only as a bulk store: every access needs a map call, the mapping is not
+   * cheap, and nothing with a deadline can live there. This firmware reports
+   * these three numbers and does not spend the memory, because nothing here
+   * currently has a use that fits that shape. See the README.
+   *
+   *   himem_physical_bytes  what is above the mapped window
+   *   himem_free_bytes      how much of it is unallocated
+   *   himem_window_bytes    the address space reserved for mapping it, which
+   *                         is subtracted from the ordinary heap
+   */
+  size_t himem_physical_bytes;
+  size_t himem_free_bytes;
+  size_t himem_window_bytes;
+
   /// Internal heap at the end of board_caps_begin(), before anything large has
   /// been taken. The baseline every later measurement is read against.
   size_t internal_free_at_boot;

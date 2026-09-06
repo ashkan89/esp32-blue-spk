@@ -89,6 +89,34 @@
 #include "ui_config.h"
 
 // ---------------------------------------------------------------- config ----
+/*
+ * The Arduino loop task's stack, raised from the core's 8 kB default.
+ *
+ * loop() in this firmware is not a small function calling a small function. It
+ * services the factory-reset poll, the mode switch, the melodies, the spoken
+ * announcements, the battery gauge, the power policy, the status LED, the
+ * clock, the web server, the DFPlayer, the radio, the UPnP renderer, the alarms
+ * and the telemetry -- and the deepest of those decide the requirement for all
+ * of them.
+ *
+ * 8 kB was enough until the renderer arrived, and then it was not: a UPnP
+ * controller's SOAP request nests a request parser under a handler under a
+ * response writer, and the board answered with
+ *
+ *     Guru Meditation Error: Core 1 panic'ed (Unhandled debug exception).
+ *     Debug exception reason: Stack canary watchpoint triggered (loopTask)
+ *
+ * The buffers that caused it are in external RAM now -- see the Scratch note in
+ * dlna.cpp, which is the actual fix. This is the margin behind it, because a
+ * stack that is exactly large enough is the same shape of problem as an IRAM
+ * segment with 684 bytes free, and this project has already had one of those.
+ *
+ * 12 kB costs 4 kB of internal DRAM, which both targets have. `diag` prints the
+ * high-water mark for this task under "task stacks"; if it ever approaches
+ * zero, the answer is to find what is deep rather than to raise this again.
+ */
+SET_LOOP_TASK_STACK_SIZE(12288);
+
 static const char *DEVICE_NAME = APP_NAME;
 
 /*
@@ -1188,6 +1216,42 @@ static void service_mode_switch() {
  * cannot answer. Both numbers matter: a heap that is 40 KB free in 4 KB pieces
  * will refuse an 8 KB allocation while looking perfectly healthy.
  */
+/*
+ * How close loop() has come to running out of stack, reported before it does.
+ *
+ * The stack canary is a watchpoint on the last words of the task's stack, and
+ * when it fires the board is already dead -- an "Unhandled debug exception"
+ * with a corrupted backtrace, which points at whatever happened to be deepest
+ * rather than at whatever was using the stack. That is a bad way to find out,
+ * and this firmware found out that way once.
+ *
+ * uxTaskGetStackHighWaterMark() is the same information an hour earlier and
+ * costs a subtraction. Warned once per threshold crossing, not once per pass,
+ * so a genuinely tight build says so and a healthy one is silent.
+ */
+static void check_loop_stack() {
+  static uint32_t next;
+  static uint16_t warnedAt = 0xFFFF;
+  const uint32_t now = millis();
+  if ((int32_t)(now - next) < 0) return;
+  next = now + 5000;
+
+  const UBaseType_t words = uxTaskGetStackHighWaterMark(nullptr);
+  const uint16_t bytes = (uint16_t)(words * sizeof(StackType_t));
+  // 1 kB is the point at which one more nested call is a real risk. Above it
+  // there is nothing useful to say.
+  if (bytes >= 1024) {
+    warnedAt = 0xFFFF;
+    return;
+  }
+  if (bytes >= warnedAt) return;
+  warnedAt = bytes;
+  LOGF("[loop] stack is down to %u bytes free at its worst. Something on the "
+       "loop task is deep; `diag` lists the tasks. Raising "
+       "SET_LOOP_TASK_STACK_SIZE in main.cpp buys room, but finding what is "
+       "deep is the better answer.\n", (unsigned)bytes);
+}
+
 static void heap_mark(const char *stage) {
   LOGF("[heap] %-18s %6u free, %6u largest\n", stage,
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
@@ -1491,6 +1555,7 @@ void loop() {
   // sees it running on the same pass rather than the next.
   alarm_loop();
   telemetry_loop();
+  check_loop_stack();
 
   poll_console();
   delay(10);

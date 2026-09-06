@@ -27,6 +27,7 @@
 #include <esp_flash.h>
 #include <esp_heap_caps.h>
 #include <esp_psram.h>
+#include <esp32/himem.h>
 
 #include "app_config.h"
 // For DFPLAYER_ENABLED, which board_can() answers BOARD_CAP_DFPLAYER from.
@@ -68,6 +69,9 @@ BoardCaps caps = {
     /* psram_ok              */ false,
     /* internal_free_at_boot */ 0,
     /* internal_largest_at_boot */ 0,
+    /* himem_physical_bytes  */ 0,
+    /* himem_free_bytes      */ 0,
+    /* himem_window_bytes    */ 0,
     /* chip_revision         */ 0,
     /* chip_model            */ "unknown",
     /* psram_unsafe_revision */ false,
@@ -140,6 +144,17 @@ void board_caps_begin() {
     caps.psram_largest_block =
         heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
     caps.psram_ok = caps.psram_mapped_bytes > 0;
+
+    /*
+     * What is above the window, asked of the API that owns it rather than
+     * inferred by subtracting. On an N16R8 this reports roughly 4 MB physical
+     * with a 256 kB mapping window -- and reporting it is the point: "8 MB
+     * fitted, 4 MB usable" looks like a fault until the third number explains
+     * where the rest went and what it would take to reach it.
+     */
+    caps.himem_physical_bytes = esp_himem_get_phys_size();
+    caps.himem_free_bytes = esp_himem_get_free_size();
+    caps.himem_window_bytes = esp_himem_reserved_area_size();
 
     /*
      * The one case where finding PSRAM is worse than not finding it.
@@ -287,6 +302,14 @@ void board_caps_begin() {
          mib(caps.psram_physical_bytes),
          (unsigned)(caps.psram_mapped_bytes / 1024u),
          (unsigned)(caps.psram_largest_block / 1024u));
+    if (caps.himem_physical_bytes) {
+      LOGF("[board] psram: %u KB of it sits above the 4 MiB data-bus window and "
+           "is reachable only through himem (%u KB free, %u KB of address space "
+           "reserved to map it). Nothing here spends it.\n",
+           (unsigned)(caps.himem_physical_bytes / 1024u),
+           (unsigned)(caps.himem_free_bytes / 1024u),
+           (unsigned)(caps.himem_window_bytes / 1024u));
+    }
     if (caps.psram_physical_bytes > caps.psram_mapped_bytes + (256u * 1024u)) {
       /*
        * Said explicitly because it looks like a fault and is not. On an N16R8

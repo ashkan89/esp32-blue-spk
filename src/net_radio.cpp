@@ -60,16 +60,18 @@ const size_t RING_BYTES_MIN = 20 * 1024;
 /*
  * What the ring is allowed to grow to when there is external RAM to put it in.
  *
- * 256 kB is about sixteen seconds of a 128 kbps stream. That is not chosen to
- * be impressive, it is chosen because it is the point past which a domestic
- * connection's problems stop being pauses and start being outages -- and an
- * outage is better reported than buffered through.
+ * 512 kB is about half a minute of a 128 kbps stream. There is far more
+ * external RAM than that going spare, and the number is not larger for a
+ * reason worth stating: past roughly half a minute a domestic connection's
+ * problems have stopped being pauses and started being outages, and an outage
+ * is better reported than buffered through. Spending four megabytes here would
+ * use the memory without improving anything.
  *
  * The WROOM never sees this. board_buffer_budget() clamps to what is actually
  * allocatable, and with no PSRAM that is the internal heap minus its reserve,
  * which lands back at RING_BYTES_MIN.
  */
-const size_t RING_BYTES_PSRAM = 256 * 1024;
+const size_t RING_BYTES_PSRAM = 512 * 1024;
 
 /// The ring this stream got. Decided in arenaAcquire() from what the board can
 /// actually spare, and constant for the life of the arena.

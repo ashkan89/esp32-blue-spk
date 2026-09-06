@@ -3672,6 +3672,16 @@ void handleCapabilities() {
   psram["largestBlock"] =
       b.psram_ok ? heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) : 0;
   psram["expectedByBuild"] = BOARD_EXPECTS_PSRAM ? true : false;
+  /*
+   * The three himem numbers, so the dashboard can explain "8 MB fitted, 4 MB
+   * usable" rather than leaving it looking like a fault. windowBytes is the
+   * address space reserved to map the rest, and it comes out of the ordinary
+   * heap -- which is why using himem is a trade rather than a free win.
+   */
+  psram["himemBytes"] = b.himem_physical_bytes;
+  psram["himemFree"] = b.himem_free_bytes;
+  psram["himemWindow"] = b.himem_window_bytes;
+  psram["addressableLimit"] = 4u * 1024u * 1024u;
   if (!b.psram_ok) psram["reason"] = board_why_not(BOARD_CAP_PSRAM);
 
   // The build expected hardware it did not find. Reported at the top level
