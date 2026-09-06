@@ -903,7 +903,8 @@ pio check -e esp32dev --skip-packages   # cppcheck over src/ only
 python scripts/test_pin_check.py        # the pin map, checked on the host
 python scripts/test_partitions.py       # the 16 MB layout and the image fit
 python scripts/test_iram_safety.py      # nothing cache-disabled code needs is in flash
-python scripts/test_settings_backup.py  # the settings backup format, ditto
+python scripts/test_settings_backup.py  # backup symmetry, and that every stored
+                                        #   setting is read back at boot
 python scripts/test_arabic_shaping.py   # Persian shaping and bidi
 python scripts/gen_arabic_tables.py     # ...and its tables, vs Unicode
 ```
@@ -3010,6 +3011,57 @@ decides which drains it, so a clip can never be played twice at half speed.
 say                    the settings, and every clip in this firmware
 say battery_low        play one
 say off                switch announcements off
+```
+
+### Settings that are stored and settings that are loaded
+
+Two different questions, and the second one had a hole in it.
+
+The Sound page did not survive a reboot: the equaliser came back flat, the
+announcement levels came back at their defaults, and the Home Assistant broker
+settings came back empty. Nothing was wrong with saving. `saveAudioSettings()`
+wrote all three blobs to NVS correctly, every time, and they were still there
+after the reboot.
+
+They were never read. The block that loads them —
+
+```c
+audio_eq_defaults(&settings.eq);   loadBlob("eq", &settings.eq);
+voice_defaults(&settings.voice);   loadBlob("voice", &settings.voice);
+ha_defaults(&settings.ha, ...);    loadBlob("haCfg", &settings.ha);
+```
+
+— was inside **`handleLeds()`**, the `POST /api/leds` handler, rather than
+inside `loadSettings()`. So the saved values were picked up only if somebody
+happened to change a lighting setting, and every boot applied a zeroed struct
+instead. It is now where it belongs, and runs in every radio mode: Bluetooth
+mode has no dashboard to configure an equaliser from, so a curve dialled in over
+Wi-Fi has to be picked up at boot or it would only ever apply in the mode it was
+set in.
+
+#### The test that would have caught it
+
+`scripts/test_settings_backup.py` already checked that every stored key has a
+home in a backup file. That is not the same question, and this bug passed it
+cleanly — the key was written, and it was in the backup.
+
+It now also checks that **every key written to NVS is read back by
+`loadSettings()`**:
+
+```
+ok    all 44 stored settings have a named home in the backup
+ok    all 44 stored settings are read back by loadSettings()
+```
+
+Two keys are exempt and say why: `radioMode` and `bootFail` are read directly by
+`management_begin()`, which needs them before `loadSettings()` has finished.
+
+Removing the `eq` load again turns the test red and names the key, which is what
+a regression test is for:
+
+```
+FAIL  1 stored setting(s) are not loaded at boot
+        eq
 ```
 
 ### Forms the poll must not touch

@@ -276,6 +276,21 @@ uint32_t ledsDirtyAt;
 constexpr uint32_t LEDS_PERSIST_QUIET_MS = 1200;
 void saveLedSettings();
 
+/*
+ * Reads a struct back out of NVS, or leaves the caller's defaults in place.
+ *
+ * Every one of these blobs is a versionless C struct, which is fine as long as
+ * a blob written by a different firmware version can never be adopted at the
+ * wrong size -- a shorter one would leave the tail uninitialised and a longer
+ * one would overrun. Comparing the length is the whole check, and it is enough:
+ * a struct that changed shape changed size in every case that has come up, and
+ * the fallback is the factory default rather than a crash.
+ */
+template <typename T>
+void loadBlob(const char *key, T *out) {
+  if (prefs.getBytesLength(key) == sizeof(T)) prefs.getBytes(key, out, sizeof(T));
+}
+
 void loadSettings(const char *fallbackName) {
   prefs.begin("speaker-web", false);
   settings.ssid = prefs.getString("ssid", "");
@@ -371,26 +386,40 @@ void loadSettings(const char *fallbackName) {
       (int)LED_IDLE_AFTER_S_MAX);
   leds_configure(settings.leds);
 
+  /*
+   * The tone stack, the announcements and the Home Assistant client.
+   *
+   * Defaults first, then whatever NVS holds on top -- the ordinary pattern,
+   * and the reason loadBlob() leaves the caller's value alone when the key
+   * is missing or the wrong size.
+   *
+   * These three lived in handleLeds() until it was noticed that the sound
+   * settings did not survive a reboot, which is exactly what that meant:
+   * saveAudioSettings() wrote them faithfully and nothing ever read them
+   * back unless somebody happened to POST to /api/leds. Every boot applied
+   * a zeroed struct instead, so the equaliser came up flat, the
+   * announcements came up at their default level, and the broker settings
+   * came up empty.
+   *
+   * They belong here, in every radio mode and not only the ones with a
+   * dashboard: Bluetooth mode has no web page to configure an equaliser
+   * from, so a curve dialled in over Wi-Fi has to be picked up at boot or
+   * it would only ever apply in the mode it was set in. management_begin()
+   * calls applyAudioSettings() straight after this for that reason.
+   */
+  audio_eq_defaults(&settings.eq);
+  loadBlob("eq", &settings.eq);
+  voice_defaults(&settings.voice);
+  loadBlob("voice", &settings.voice);
+  settings.voiceDevices = prefs.getString("voiceDev", "");
+  ha_defaults(&settings.ha, settings.hostname.c_str());
+  loadBlob("haCfg", &settings.ha);
+
   stableDeviceName = settings.deviceName;
 }
 
 /// Hands the stored pack description to the gauge. Called from
 /// management_begin() before the gauge starts, and again on every settings save.
-/*
- * Reads a struct back out of NVS, or leaves the caller's defaults in place.
- *
- * Every one of these blobs is a versionless C struct, which is fine as long as
- * a blob written by a different firmware version can never be adopted at the
- * wrong size -- a shorter one would leave the tail uninitialised and a longer
- * one would overrun. Comparing the length is the whole check, and it is enough:
- * a struct that changed shape changed size in every case that has come up, and
- * the fallback is the factory default rather than a crash.
- */
-template <typename T>
-void loadBlob(const char *key, T *out) {
-  if (prefs.getBytesLength(key) == sizeof(T)) prefs.getBytes(key, out, sizeof(T));
-}
-
 void applyAudioSettings() {
   audio_eq_configure(settings.eq);
   voice_configure(settings.voice);
@@ -2152,14 +2181,6 @@ void handleLeds() {
                                           (int)LED_IDLE_AFTER_S_MIN,
                                           (int)LED_IDLE_AFTER_S_MAX);
   }
-
-  audio_eq_defaults(&settings.eq);
-  loadBlob("eq", &settings.eq);
-  voice_defaults(&settings.voice);
-  loadBlob("voice", &settings.voice);
-  settings.voiceDevices = prefs.getString("voiceDev", "");
-  ha_defaults(&settings.ha, settings.hostname.c_str());
-  loadBlob("haCfg", &settings.ha);
 
   settings.leds = next;
   leds_configure(next);

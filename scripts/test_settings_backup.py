@@ -68,6 +68,15 @@ EXCLUDED = {
     "bootFail": "the boot sentinel's strike count describes a boot, not a preference",
 }
 
+# Keys that are deliberately NOT read by loadSettings(), with the reason.
+# Everything else that reaches NVS has to be read back at boot, or the
+# setting silently does not survive a reboot -- see the check below.
+BOOT_LOAD_EXEMPT = {
+    "radioMode": "read directly by management_begin(), which needs it before "
+                 "loadSettings() has finished",
+    "bootFail": "the boot sentinel, read alongside radioMode for the same reason",
+}
+
 # Settings that live in another module's NVS namespace, so they never appear in
 # a prefs.put*() call in management.cpp. They are still settings, and still have
 # to be in the file.
@@ -175,8 +184,20 @@ SECRET_KEYS = {
 
 
 def function_body(source, name):
-    """The text of one free function, from its signature to the next one."""
-    start = source.index("void %s() {" % name)
+    """The text of one free function, from its signature to the next one.
+
+    Matches a parameter list as well as an empty one: loadSettings() takes a
+    fallback name, and the boot-load check needs its body.
+    """
+    # The DEFINITION, not a forward declaration: the signature has to end in
+    # "{" on the same line. Matching "^void name(" alone finds a prototype
+    # first and returns an empty body, which reads as "this function writes
+    # nothing" and quietly passes every check in this file.
+    match = re.search(r"^void %s\([^;\n]*\)\s*\{" % re.escape(name),
+                      source, re.M)
+    if match is None:
+        raise ValueError("no free function named %s" % name)
+    start = match.start()
     end = source.index("\nvoid ", start + 10)
     return source[start:end]
 
@@ -354,6 +375,32 @@ def main():
     else:
         print("ok    all %d stored settings have a named home in the backup"
               % len(persisted))
+
+    # 2b. Everything persisted is also READ BACK AT BOOT.
+    #
+    # This is not the same question as (2) and it is the one that bites. A key
+    # can be written faithfully, have a home in the backup file, and still be
+    # missing from loadSettings() -- in which case the setting is stored, never
+    # loaded, and every reboot comes up with the compiled-in default while the
+    # saved value sits in flash being ignored.
+    #
+    # That is not hypothetical. The equaliser, the announcement levels and the
+    # Home Assistant configuration were read inside handleLeds() instead of
+    # loadSettings(), so the sound settings only survived a reboot if somebody
+    # happened to POST to /api/leds first. This check is what that cost.
+    boot_body = function_body(source, "loadSettings")
+    loaded = set(re.findall(r"prefs\.get\w+\(\"([A-Za-z0-9]+)\"", boot_body))
+    loaded |= set(re.findall(r"loadBlob\(\"([A-Za-z0-9]+)\"", boot_body))
+    unloaded = persisted - loaded - set(BOOT_LOAD_EXEMPT)
+    if unloaded:
+        failures.append("written to NVS but never read by loadSettings(), so it "
+                        "does not survive a reboot: " + ", ".join(sorted(unloaded)))
+        print("FAIL  %d stored setting(s) are not loaded at boot" % len(unloaded))
+        for key in sorted(unloaded):
+            print("        %s" % key)
+    else:
+        print("ok    all %d stored settings are read back by loadSettings()"
+              % len(persisted - set(BOOT_LOAD_EXEMPT)))
 
     # And the table cannot go stale in the other direction either.
     ghosts = set(NVS_HOME) - persisted
