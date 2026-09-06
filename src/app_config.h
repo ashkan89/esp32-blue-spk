@@ -63,6 +63,22 @@
 #define DIAGNOSTICS_ENABLED 1
 #endif
 
+/*
+ * AudioTools' own logging, at Info instead of Warning.
+ *
+ * Off by default: the library logs from inside the decode path, and that much
+ * text at 115200 baud stalls the I2S writer into an underrun. Switch it on for
+ * one specific job -- finding where an HTTP stream setup fails inside the
+ * library, which narrates each step (connect, header write, reply) in a way
+ * this firmware's own logging cannot see from outside.
+ *
+ *     pio run -e esp32_wrover_e_n16r8 -t upload
+ *         with build_flags += -DAUDIOTOOLS_LOG_INFO=1
+ */
+#ifndef AUDIOTOOLS_LOG_INFO
+#define AUDIOTOOLS_LOG_INFO 0
+#endif
+
 /// True when anything at all wants the UART, which is what decides whether
 /// setup() opens it.
 #define SERIAL_PORT_USED (SERIAL_LOG || CONSOLE_ENABLED || DIAGNOSTICS_ENABLED)

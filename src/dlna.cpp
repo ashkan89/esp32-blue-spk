@@ -45,6 +45,17 @@
 #include "net_radio.h"
 #include "player_state.h"
 
+/*
+ * The renderer accepts exactly what the player accepts.
+ *
+ * These were equal by coincidence once, and a URI that passed
+ * uriAcceptable() and was then refused by net_radio_play_url() would fail as
+ * a bare "transport not available" with nothing to explain it. Checked here
+ * so the two cannot drift.
+ */
+static_assert(DLNA_URI_MAX <= RADIO_PLAY_URL_MAX,
+              "a URI the renderer accepts must fit the player's buffer");
+
 namespace {
 
 // ============================================================== constants ===

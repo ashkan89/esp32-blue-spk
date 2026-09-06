@@ -198,7 +198,7 @@ struct Request {
   volatile bool changed;
   volatile bool play;
   int8_t station;
-  char url[RADIO_URL_MAX];
+  char url[RADIO_PLAY_URL_MAX];
   char name[RADIO_NAME_MAX];
 };
 Request request;
@@ -767,11 +767,34 @@ void runStream(const char *url, bool *stopped) {
   metaTitle[0] = metaName[0] = metaGenre[0] = 0;
   metaDirty = false;
   stream->setMetadataCallback(onMetadata);
-  // Shoutcast servers answer a plain GET with an ICY/1.0 status line rather
-  // than HTTP/1.0, and some of them only send the metadata this asks for.
-  stream->addRequestHeader("User-Agent", "esp32-blue-spk");
+  /*
+   * The user agent, set through the library's own accessor rather than pushed
+   * into the request header before begin().
+   *
+   * Both end up sending the same line -- HttpRequest::processBegin() does
+   * put(USER_AGENT, agent), and agent defaults to nullptr, which is why one has
+   * to be supplied at all: without it no User-Agent is sent, and some Shoutcast
+   * servers answer that with a redirect or a refusal.
+   *
+   * The difference is when the header list is touched. addRequestHeader()
+   * mutates it before begin() has set the client up; setAgent() only stores a
+   * pointer and lets the library add the line inside its own sequence. That is
+   * the intended path, and it removes the one thing this firmware did to the
+   * request header out of order -- which matters because the fault being chased
+   * here is a null entry in exactly that list.
+   */
+  stream->httpRequest().setAgent("esp32-blue-spk");
 
   setState(RADIO_CONNECTING);
+  /*
+   * The whole address and its length, before the HTTP client sees it.
+   *
+   * Not decoration. A stream that fails inside the client library gives a
+   * backtrace through the library and says nothing about what it was asked to
+   * fetch, and the two things worth knowing at that point are the exact URL and
+   * whether anything shortened it on the way in.
+   */
+  LOGF("[radio] opening (%u chars): %s\n", (unsigned)strlen(url), url);
   const uint32_t startedAt = millis();
   const bool opened = stream->begin(url, "audio/mpeg");
 
@@ -950,7 +973,9 @@ void runStream(const char *url, bool *stopped) {
 
 void radioTask(void *) {
   uint32_t backoff = RECONNECT_MIN_MS;
-  char url[RADIO_URL_MAX] = {0};
+  // The task's own copy of what it was last asked to play. Sized for the
+  // pushed case, because that is what arrives in request.url.
+  char url[RADIO_PLAY_URL_MAX] = {0};
 
   for (;;) {
     // Pick up whatever was last asked for.
@@ -1091,8 +1116,16 @@ bool net_radio_begin(void *out) {
    * below the network stack, which is the order the audio actually needs.
    */
   running = true;
-  LOGF("[radio] ready, %u stations, %u kB buffer when playing\n",
-                (unsigned)stationCount, (unsigned)(arenaBytes / 1024));
+  /*
+   * The buffer is sized when a stream starts, not now -- board_buffer_budget()
+   * asks what is actually allocatable at that moment. Printing arenaBytes here
+   * reported the floor, which on a board with external RAM was off by a factor
+   * of twenty. Say what the policy is instead; arenaAcquire() logs the number.
+   */
+  LOGF("[radio] ready, %u stations, buffer %u-%u kB, sized when a stream starts\n",
+                (unsigned)stationCount,
+                (unsigned)((RING_BYTES_MIN + READ_CHUNK + DECODE_CHUNK) / 1024),
+                (unsigned)((RING_BYTES_PSRAM + READ_CHUNK + DECODE_CHUNK) / 1024));
 
   /*
    * Did the last boot survive its own autostart?
@@ -1229,6 +1262,20 @@ bool net_radio_play_station(uint8_t index) {
 
 bool net_radio_play_url(const char *url, const char *name) {
   if (!running || !urlLooksPlayable(url)) return false;
+  /*
+   * Refused, not truncated.
+   *
+   * snprintf() into request.url would have made this fit by cutting the tail
+   * off, and the result is a well-formed request for a resource that does not
+   * exist -- or, worse, a URL whose structure the parser no longer recognises.
+   * Either way the failure surfaces a long way from the cause. A caller that
+   * gets false here can say something useful instead.
+   */
+  if (strlen(url) >= RADIO_PLAY_URL_MAX) {
+    LOGF("[radio] refusing a %u-character address; the limit is %u\n",
+         (unsigned)strlen(url), (unsigned)(RADIO_PLAY_URL_MAX - 1));
+    return false;
+  }
   if (df_player_running()) df_player_pause();
   char fallback[RADIO_NAME_MAX];
   if (!name || !name[0]) {

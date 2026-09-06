@@ -1304,7 +1304,25 @@ void setup() {
 
   status_led_begin(PIN_STATUS_LED, STATUS_LED_ACTIVE_HIGH);
 
+  /*
+   * How much AudioTools says for itself.
+   *
+   * Warning by default, and the reason is in the platformio.ini note about
+   * CORE_DEBUG_LEVEL: this library logs from inside the decode path, and
+   * pushing that much text out of a 115200 baud UART stalls the I2S writer long
+   * enough to underrun.
+   *
+   * Info is for one job -- finding out where an HTTP stream setup dies inside
+   * the library, which its own log narrates step by step and ours cannot see.
+   * Build with -DAUDIOTOOLS_LOG_INFO=1 to turn it on, reproduce, and turn it
+   * off again. It is deliberately not a runtime setting: it is a debugging
+   * tool, not a preference.
+   */
+#if AUDIOTOOLS_LOG_INFO
+  AudioLogger::instance().begin(Serial, AudioLogger::Info);
+#else
   AudioLogger::instance().begin(Serial, AudioLogger::Warning);
+#endif
 
   // The shared state and the analyser have to exist before anything can write
   // to them, which for the analyser means before the first audio packet.

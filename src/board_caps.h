@@ -280,14 +280,20 @@ struct BoardCaps {
    * these three numbers and does not spend the memory, because nothing here
    * currently has a use that fits that shape. See the README.
    *
-   *   himem_physical_bytes  what is above the mapped window
-   *   himem_free_bytes      how much of it is unallocated
-   *   himem_window_bytes    the address space reserved for mapping it, which
-   *                         is subtracted from the ordinary heap
+   * This firmware deliberately does NOT link the himem API, and that is worth
+   * stating because it looks like an omission. Referencing any esp_himem_*
+   * function pulls in its startup hook, which reserves
+   * CONFIG_SPIRAM_BANKSWITCH_RESERVE banks -- 256 kB here -- out of the
+   * directly addressable window to have somewhere to map into. Measured on a
+   * WROVER-E: calling those functions purely to report their numbers took the
+   * mapped heap from 4096 kB to 3840 kB. Paying a quarter of a megabyte of
+   * usable memory for a diagnostic about memory we do not use is the wrong
+   * trade, so the figure below is arithmetic instead.
+   *
+   * If something ever genuinely wants a bulk store up there, linking himem is
+   * the way and the 256 kB is its honest price.
    */
-  size_t himem_physical_bytes;
-  size_t himem_free_bytes;
-  size_t himem_window_bytes;
+  size_t psram_unmapped_bytes;
 
   /// Internal heap at the end of board_caps_begin(), before anything large has
   /// been taken. The baseline every later measurement is read against.

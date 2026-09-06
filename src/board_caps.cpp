@@ -27,7 +27,6 @@
 #include <esp_flash.h>
 #include <esp_heap_caps.h>
 #include <esp_psram.h>
-#include <esp32/himem.h>
 
 #include "app_config.h"
 // For DFPLAYER_ENABLED, which board_can() answers BOARD_CAP_DFPLAYER from.
@@ -69,9 +68,7 @@ BoardCaps caps = {
     /* psram_ok              */ false,
     /* internal_free_at_boot */ 0,
     /* internal_largest_at_boot */ 0,
-    /* himem_physical_bytes  */ 0,
-    /* himem_free_bytes      */ 0,
-    /* himem_window_bytes    */ 0,
+    /* psram_unmapped_bytes  */ 0,
     /* chip_revision         */ 0,
     /* chip_model            */ "unknown",
     /* psram_unsafe_revision */ false,
@@ -146,15 +143,18 @@ void board_caps_begin() {
     caps.psram_ok = caps.psram_mapped_bytes > 0;
 
     /*
-     * What is above the window, asked of the API that owns it rather than
-     * inferred by subtracting. On an N16R8 this reports roughly 4 MB physical
-     * with a 256 kB mapping window -- and reporting it is the point: "8 MB
-     * fitted, 4 MB usable" looks like a fault until the third number explains
-     * where the rest went and what it would take to reach it.
+     * What is above the window, by subtraction rather than by asking himem.
+     *
+     * Asking is what it costs: esp_himem_get_phys_size() and friends drag in
+     * the himem startup hook, which reserves 256 kB of the addressable window
+     * to map into. That was measured -- the mapped heap went from 4096 kB to
+     * 3840 kB the moment those calls were added, for a number that could be
+     * had by subtracting. See the note on psram_unmapped_bytes.
      */
-    caps.himem_physical_bytes = esp_himem_get_phys_size();
-    caps.himem_free_bytes = esp_himem_get_free_size();
-    caps.himem_window_bytes = esp_himem_reserved_area_size();
+    caps.psram_unmapped_bytes =
+        caps.psram_physical_bytes > caps.psram_mapped_bytes
+            ? caps.psram_physical_bytes - caps.psram_mapped_bytes
+            : 0;
 
     /*
      * The one case where finding PSRAM is worse than not finding it.
@@ -302,25 +302,19 @@ void board_caps_begin() {
          mib(caps.psram_physical_bytes),
          (unsigned)(caps.psram_mapped_bytes / 1024u),
          (unsigned)(caps.psram_largest_block / 1024u));
-    if (caps.himem_physical_bytes) {
-      LOGF("[board] psram: %u KB of it sits above the 4 MiB data-bus window and "
-           "is reachable only through himem (%u KB free, %u KB of address space "
-           "reserved to map it). Nothing here spends it.\n",
-           (unsigned)(caps.himem_physical_bytes / 1024u),
-           (unsigned)(caps.himem_free_bytes / 1024u),
-           (unsigned)(caps.himem_window_bytes / 1024u));
-    }
-    if (caps.psram_physical_bytes > caps.psram_mapped_bytes + (256u * 1024u)) {
+    if (caps.psram_unmapped_bytes > 256u * 1024u) {
       /*
        * Said explicitly because it looks like a fault and is not. On an N16R8
        * this line reports roughly 8 MB fitted and roughly 4 MB usable, and
        * anybody reading it deserves to know that is the architecture rather
        * than a broken module or a bad solder joint.
        */
-      LOGF("[board] psram: the %u MB above the mapped window needs the banked "
-           "himem API and is not ordinary malloc memory. Nothing here budgets "
-           "it as such.\n",
-           mib(caps.psram_physical_bytes - caps.psram_mapped_bytes));
+      LOGF("[board] psram: the %u MB above the 4 MiB data-bus window is not "
+           "addressable as ordinary memory. Reaching it needs the banked himem "
+           "API, which this build does not link -- doing so would reserve "
+           "256 KB of the window above to map into, and nothing here has a use "
+           "for a bulk store.\n",
+           mib(caps.psram_unmapped_bytes));
     }
   } else {
     LOGF("[board] psram: none%s\n",

@@ -3699,10 +3699,9 @@ void handleCapabilities() {
    * address space reserved to map the rest, and it comes out of the ordinary
    * heap -- which is why using himem is a trade rather than a free win.
    */
-  psram["himemBytes"] = b.himem_physical_bytes;
-  psram["himemFree"] = b.himem_free_bytes;
-  psram["himemWindow"] = b.himem_window_bytes;
+  psram["unmappedBytes"] = b.psram_unmapped_bytes;
   psram["addressableLimit"] = 4u * 1024u * 1024u;
+  psram["himemLinked"] = false;
   if (!b.psram_ok) psram["reason"] = board_why_not(BOARD_CAP_PSRAM);
 
   // The build expected hardware it did not find. Reported at the top level

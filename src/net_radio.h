@@ -86,7 +86,36 @@
 static const uint8_t RADIO_MAX_STATIONS = 12;
 
 static const size_t RADIO_NAME_MAX = 40;
+/*
+ * A saved favourite's address.
+ *
+ * This one is frozen at 160 rather than chosen: RadioStation is written to NVS
+ * as a raw struct, and the loader adopts the blob only when its length matches
+ * sizeof(). Widening this field changes that length, so every saved station on
+ * every existing speaker would be silently discarded at the next boot. Not
+ * worth it for a favourite somebody typed by hand.
+ */
 static const size_t RADIO_URL_MAX = 160;
+
+/*
+ * An address handed over to be played once, which is a different thing.
+ *
+ * Nothing persists it, so it costs a little RAM and no compatibility. It needs
+ * to be much larger because the addresses that arrive this way are not typed by
+ * anybody: a UPnP controller pushing a track from a media server sends
+ * something like
+ *
+ *   http://192.168.1.20:10246/MDEServer/2DC2F56A-.../0_e0RDOjovL1VzZXJz.../x.mp3
+ *
+ * and 160 characters does not hold it. It used to be truncated to fit -- which
+ * is worse than refusing, because a truncated URL is a syntactically valid
+ * request for the wrong resource, and what comes back is a 404 or a parser
+ * edge case rather than an error anybody can act on.
+ *
+ * net_radio_play_url() now refuses what will not fit, and dlna.cpp refuses it
+ * one step earlier so the controller is told at SetAVTransportURI time.
+ */
+static const size_t RADIO_PLAY_URL_MAX = 300;
 
 /// Text fields the stream itself supplies. Sized for what a 128x32 OLED and a
 /// dashboard card can actually show, not for what a station might send.
@@ -119,7 +148,9 @@ struct RadioStatus {
   RadioState state;
   int8_t station;  ///< index of the favourite playing, or -1 for an ad-hoc URL
 
-  char url[RADIO_URL_MAX];
+  /// The address being played. RADIO_PLAY_URL_MAX rather than RADIO_URL_MAX:
+  /// this one is never stored, and a pushed URL is far longer than a typed one.
+  char url[RADIO_PLAY_URL_MAX];
   /// What the station calls itself: the icy-name header if it sent one, the
   /// stored favourite's name if not, and the host from the URL as a last
   /// resort. Never empty while anything is playing.
