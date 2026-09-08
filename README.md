@@ -3365,6 +3365,19 @@ It reads `tcp_active_pcbs` / `tcp_tw_pcbs` / `tcp_bound_pcbs` from
 `CONFIG_LWIP_CHECK_THREAD_SAFETY=y` here, so touching those lists without it
 would trip a different assertion of lwIP's own.
 
+The lock is also not *there* until `tcpip_init()` has run, and that was a boot
+loop on the WROOM (COM3, 2026-09-08). `lock_tcpip_core` is a plain global that
+lwIP creates on its first use; the guard's first tick lands 200 ms after
+`heap_guard_begin()`, still inside `ui_begin()` and long before the first Wi-Fi
+call — and in Bluetooth mode that call never comes at all, by design. Taking a
+NULL semaphore is `assert failed: xQueueSemaphoreTake queue.c:1709 (( pxQueue
+))`, every boot, at the `[heap] leds` line. It fires before `management_begin()`
+records a boot strike, so the mode fallback never had a chance. The census now
+asks the port whether lwIP is up — `sys_thread_tcpip(LWIP_CORE_IS_TCPIP_INITIALIZED)`,
+the same query lwIP's own `LWIP_ASSERT_CORE_LOCKED()` uses — and returns an
+empty count until it is. A Wi-Fi-mode board only ever dodged this when
+`WiFi.mode()` happened to win the race with the first tick.
+
 #### A separate defect the same numbers exposed
 
 Two settings in this build, together:

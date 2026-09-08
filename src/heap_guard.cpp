@@ -36,6 +36,7 @@
  */
 #include <lwip/priv/tcp_priv.h>
 #include <lwip/tcpip.h>
+#include <arch/sys_arch.h>  // sys_thread_tcpip(), the "is lwIP up yet" query
 
 #include "app_config.h"
 #include "dlna.h"
@@ -145,6 +146,33 @@ struct Census {
  */
 Census pcbCensus() {
   Census c = {0, 0, 0, false, nullptr, 0, 0, 0, 0};
+
+  /*
+   * Only once lwIP exists. This line is what the WROOM's boot loop was.
+   *
+   * lock_tcpip_core is a plain global that tcpip_init() creates, and nothing
+   * creates it earlier. The first tick of this task lands 200 ms after
+   * heap_guard_begin(), which is still inside ui_begin() -- long before
+   * management_begin() makes the first Wi-Fi call. And in Bluetooth mode that
+   * call never comes at all: the profile deliberately leaves the driver
+   * uninitialised, so the mutex is NULL for the life of the boot. Taking a
+   * NULL semaphore is a FreeRTOS assert:
+   *
+   *   assert failed: xQueueSemaphoreTake queue.c:1709 (( pxQueue ))
+   *
+   * and because it fires before management_begin() records a boot strike, the
+   * mode fallback never triggers -- the board panics, reboots, and panics
+   * again at the same [heap] leds line forever. Seen on the WROOM on COM3,
+   * 2026-09-08; a Wi-Fi-mode board only dodges it when WiFi.mode() happens to
+   * win the race with the first tick.
+   *
+   * This is the port's own "has tcpip_init() run" query, the one lwIP's
+   * LWIP_ASSERT_CORE_LOCKED() consults for the same reason. The TCP/IP thread
+   * sets it as its first act, after the core mutex already exists, so a true
+   * answer here means the lock below is a real semaphore. Until then there are
+   * no PCBs to count and the census is simply empty.
+   */
+  if (!sys_thread_tcpip(LWIP_CORE_IS_TCPIP_INITIALIZED)) return c;
 
   LOCK_TCPIP_CORE();
   for (struct tcp_pcb *pcb = tcp_active_pcbs; pcb; pcb = pcb->next) {
