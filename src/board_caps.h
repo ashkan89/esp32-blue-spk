@@ -161,7 +161,7 @@
  * exactly as it does now, with the Wi-Fi-only radio mode it has always had.
  */
 #ifndef WROOM_ALLOW_RADIO
-#define WROOM_ALLOW_RADIO 0
+#define WROOM_ALLOW_RADIO 1
 #endif
 
 #ifndef CAP_NET_RADIO

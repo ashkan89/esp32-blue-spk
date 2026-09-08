@@ -3378,6 +3378,71 @@ the same query lwIP's own `LWIP_ASSERT_CORE_LOCKED()` uses — and returns an
 empty count until it is. A Wi-Fi-mode board only ever dodged this when
 `WiFi.mode()` happened to win the race with the first tick.
 
+#### The WROOM's renderer: refused its own buffer (COM3, 2026-09-08)
+
+On the WROOM the renderer accepted every `SetAVTransportURI`, the radio logged
+`opening` for the same URL every few seconds, and nothing ever played. The
+serial log said nothing else, because the failure was recorded only in
+`status.error`; the console's `station` command was what finally read it out:
+**"Not enough memory left for the stream buffer"**, and `diag` put the heap at
+67 kB free with a 59 kB largest block.
+
+The cause was `board_buffer_budget()` in
+[src/board_caps.cpp](src/board_caps.cpp). On a board without PSRAM it applied
+the 72 kB `INTERNAL_RESERVE` to the *largest block* before granting even the
+caller's floor — so a 24 kB ring needed a 96 kB contiguous block, and a WROOM
+in Wi-Fi mode with the renderer and the dashboard up has about 60. Before the
+dual-target work the same 24 kB came from a plain `malloc()` after
+`runStream()`'s own 70 kB / 26 kB pre-flight check, and it played. The budget
+now grants the floor whenever it fits with a few kilobytes of slack beside it
+(`INTERNAL_FLOOR_SLACK`), and applies the reserve only to how far the ring may
+grow *past* the floor — which is the reserve's actual job: protecting the TLS
+handshake and the DMA descriptors from a buffer sized to the last byte.
+
+Two things came with it. `setState(RADIO_ERROR, why)` now prints
+`[radio] error: <why>` on the serial log, so a stream that dies between
+`opening` and `playing` names its reason without anybody having to ask. And
+the 70 kB pre-flight floor is still real on this board: with the renderer, the
+dashboard polling and mDNS all resident the heap sits between 64 and 71 kB, and
+a request that arrives on the wrong side of that line is refused with
+`refusing to start a http stream` — a report, now, rather than a silence.
+
+**The second face of the same shortage, and it was a hang.** With the buffer
+granted, the first cast got one step further and stopped there:
+`libhelix - allocateation failed for 8708 bytes`, then `loop() has not run for
+13 s`, radio task *running*, radio state still *connecting*, until EN was
+pressed. libhelix's allocator (`utils/Allocator.h`) does not return null on an
+allocation failure — it logs and executes `while(true);` — and it does so on
+the radio task, which outranks loop() on the same core. `MP3InitDecoder()`
+makes eight allocations totalling ~29 kB; the 8.7 kB subband state was the one
+that ran the heap out. `runStream()` now checks `DECODER_HEAP_NEED` /
+`DECODER_BLOCK_NEED` after the arena and before the decoder is constructed, and
+a shortfall is `Not enough memory for the decoder: N free, M block` in
+`status.error` and on the log — a retry on the backoff instead of a board that
+needs its button pressed.
+
+**Where the heap goes on a WROOM, measured over the console (2026-09-08):**
+
+| state | heap free | largest block |
+| --- | --- | --- |
+| Wi-Fi up, dashboard, renderer off | 105 kB | 55 kB |
+| renderer on, idle | 93 kB | 55 kB |
+| renderer + phone controller + dashboard polling + radio task (10 kB stack) | 64–71 kB | 35–61 kB |
+| FIP playing (128 kbps), 20 kB ring, dashboard open, renderer off | 13–15 kB | 5 kB |
+
+against a stream that needs ~67 kB with the 20 kB ring. The last row is the one
+that decided the policy: the station played cleanly, and while it did the
+dashboard's WebServer could not allocate a receive buffer (`fillBuffer(): Not
+enough memory`, `Invalid request`), with a heap low-water mark of 5.5 kB for the
+boot. Passing the start floor is not the same as having room to run.
+
+`RING_BYTES_TIGHT` (12 kB, three quarters of a second at 128 kbps) is the
+concession. On a board whose ring is internal, whenever the heap at Play is
+below `STREAM_TIGHT_BELOW` (104 kB — the measured point under which the full
+ring leaves less than ~20 kB spare while playing), the small ring is used and
+the log says so; the same rule also rescues a start the full ring alone would
+have had refused. A WROVER never takes this path: its ring lives in PSRAM.
+
 #### A separate defect the same numbers exposed
 
 Two settings in this build, together:

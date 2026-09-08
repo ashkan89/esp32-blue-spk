@@ -49,6 +49,14 @@ namespace {
 constexpr size_t INTERNAL_RESERVE = 72u * 1024u;
 
 /*
+ * What a floor-sized internal buffer must leave beside itself: the heap's own
+ * block headers and the few kilobytes an I2S descriptor set needs from the
+ * same pool. Deliberately small -- see board_buffer_budget() for why the floor
+ * is not held to INTERNAL_RESERVE.
+ */
+constexpr size_t INTERNAL_FLOOR_SLACK = 4u * 1024u;
+
+/*
  * External-RAM headroom, same argument one level out.
  *
  * Smaller in proportion because there is much more of it and far fewer things
@@ -484,9 +492,31 @@ size_t board_buffer_budget(size_t want, size_t floor) {
    * caller's floor and only out of what is left above the reserve.
    */
   const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-  if (largest <= INTERNAL_RESERVE) return 0;
-  const size_t usable = largest - INTERNAL_RESERVE;
-  if (usable < floor) return 0;
+
+  /*
+   * The floor is granted on its own terms; the reserve governs the growth.
+   *
+   * This used to apply INTERNAL_RESERVE to the floor as well, and on the WROOM
+   * that was a regression dressed as caution: a 24 kB ring needed a 96 kB
+   * contiguous block, and a WROOM in Wi-Fi mode with the renderer and the
+   * dashboard up has about 60 kB. So net_radio's runStream() cleared its own
+   * 70 kB / 26 kB floors, opened the stream, asked for the arena -- and was
+   * refused, every time, with nothing on the serial log but the heap guard's
+   * census. The renderer sat in "reconnecting" and re-opened the same URL every
+   * few seconds for as long as anybody watched (COM3, 2026-09-08). Before the
+   * dual-target work this was a plain malloc() of the same 24 kB after the
+   * same floor check, and it played.
+   *
+   * The caller's floor is the caller's promise that it has already asked the
+   * harder question -- whether the stream as a whole fits -- so the budget
+   * only insists on the floor itself plus room for what the heap needs around
+   * it. The reserve still does its real job: nothing grows PAST the floor out
+   * of the last 72 kB, which is where the TLS handshake and the DMA
+   * descriptors live.
+   */
+  if (largest < floor + INTERNAL_FLOOR_SLACK) return 0;
+  const size_t usable = largest > INTERNAL_RESERVE ? largest - INTERNAL_RESERVE : 0;
+  if (usable <= floor) return floor;
   return want <= usable ? want : usable;
 }
 

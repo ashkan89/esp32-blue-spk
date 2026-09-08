@@ -60,6 +60,23 @@ namespace {
 const size_t RING_BYTES_MIN = 20 * 1024;
 
 /*
+ * The ring a board without PSRAM falls back to when the full one is what
+ * stands between the stream and its heap floor.
+ *
+ * 12 kB is three quarters of a second at 128 kbps. That is thin for a distant
+ * Icecast station and plenty for a file pushed across the room by a UPnP
+ * controller, which is what a WROOM in this situation is almost always
+ * playing: with the renderer (12.5 kB resident), the dashboard polling and
+ * the radio task's own stack all in internal heap, the WROOM has been
+ * measured at 64-71 kB free at the moment Play arrives, and the stream
+ * needs ~67 kB with the 20 kB ring. Eight kilobytes is the difference between
+ * "refusing to start" and playing. The full ring is still used whenever the
+ * heap allows it; this is the second choice, taken only after the first is
+ * known not to fit, and it is logged when it happens.
+ */
+const size_t RING_BYTES_TIGHT = 12 * 1024;
+
+/*
  * What the ring is allowed to grow to when there is external RAM to put it in.
  *
  * 512 kB is about half a minute of a 128 kbps stream. There is far more
@@ -140,6 +157,48 @@ const uint32_t CONNECT_TIMEOUT_MS = 12000;
  */
 const uint32_t STREAM_HEAP_FLOOR = 70000;
 const uint32_t STREAM_BLOCK_FLOOR = 26000;
+
+/*
+ * What the decoder must find AFTER the connection is up and the arena is in.
+ *
+ * This check exists because libhelix's allocator does not fail: its OOM path
+ * (utils/Allocator.h, both the default and the ESP32 variant) is a LOGE line
+ * followed by `while(true);`. MP3InitDecoder() makes eight allocations, the
+ * largest around 8.7 kB (the subband state), and on the WROOM with the
+ * renderer and dashboard resident the seventh or eighth of them is where the
+ * heap ran out -- after which the radio task, which outranks loop() on the
+ * same core, spun forever. The console froze, the dashboard froze, the
+ * renderer stopped answering, and the only way out was EN (COM3, 2026-09-08:
+ * "libhelix - allocateation failed for 8708 bytes", then "loop() has not run
+ * for 13 s", radio task state running, radio state still connecting).
+ *
+ * So the decoder is not constructed unless its memory is visibly there. The
+ * numbers are the measured table above (~29 kB of state in eight pieces plus
+ * 7 kB of frame and PCM buffers) with a little room, and the block figure is
+ * the largest single piece with the same room.
+ */
+const uint32_t DECODER_HEAP_NEED = 40000;
+const uint32_t DECODER_BLOCK_NEED = 10000;
+
+/*
+ * Below this much free internal heap at Play, a board without PSRAM takes the
+ * small ring (RING_BYTES_TIGHT) rather than the full one.
+ *
+ * Measured on the WROOM, 2026-09-08, Wi-Fi mode, dashboard open, renderer
+ * off: 100 kB free when Play arrived, the full 20 kB ring granted, the station
+ * playing cleanly -- and 13 kB free while it played, with a low-water mark of
+ * 5.5 kB for the boot. At that level the dashboard's own WebServer could not
+ * allocate a receive buffer ("fillBuffer(): Not enough memory", then "Invalid
+ * request") and every page load fought the stream for the last block. Passing
+ * the 70 kB start floor is not the same as having room to run.
+ *
+ * So the question asked here is not "can it start" but "what is left once it
+ * has": the stream's own ~67 kB plus ~20 kB of pbufs and dashboard traffic
+ * that arrive while it plays. Under this line the eight kilobytes the small
+ * ring gives back are worth more as headroom than as buffer. A WROVER never
+ * reaches this: its ring is in external RAM and the internal heap is untouched.
+ */
+const uint32_t STREAM_TIGHT_BELOW = 104000;
 
 /*
  * What https costs on top, and why it usually does not fit.
@@ -271,7 +330,7 @@ Id3Skip id3;
 RadioStation *stations;
 uint8_t stationCount;
 
-bool arenaAcquire() {
+bool arenaAcquire(bool tight = false) {
   heap_guard_mark("radio: sizing the jitter buffer");
   if (arena) return true;
 
@@ -285,8 +344,10 @@ bool arenaAcquire() {
    * plain malloc() and a fixed constant.
    */
   const size_t fixed = READ_CHUNK + DECODE_CHUNK;
-  const size_t budget = board_buffer_budget(RING_BYTES_PSRAM + fixed,
-                                            RING_BYTES_MIN + fixed);
+  // The floor is the smallest ring this stream has agreed to live with; see
+  // RING_BYTES_TIGHT for when runStream() asks for the smaller one.
+  const size_t floor = (tight ? RING_BYTES_TIGHT : RING_BYTES_MIN) + fixed;
+  const size_t budget = board_buffer_budget(RING_BYTES_PSRAM + fixed, floor);
   if (!budget) return false;
 
   arena = (uint8_t *)board_alloc(budget, /*allow_internal=*/true);
@@ -294,7 +355,7 @@ bool arenaAcquire() {
     // The budget said it would fit and the allocator disagreed, which means
     // something took the block in between. Fall back to the floor rather than
     // failing the stream: a small ring plays, and no ring does not.
-    arenaBytes = RING_BYTES_MIN + fixed;
+    arenaBytes = floor;
     arena = (uint8_t *)board_alloc(arenaBytes, /*allow_internal=*/true);
     if (!arena) return false;
   } else {
@@ -683,6 +744,18 @@ void setState(RadioState state, const char *error = nullptr) {
   if (error) copyString(status.error, sizeof(status.error), error);
   else if (state != RADIO_ERROR) status.error[0] = 0;
   statusUnlock();
+  /*
+   * The reason, on the serial log as well as in the status.
+   *
+   * Every failure between "opening" and "playing" used to be reported only to
+   * whoever asked over the console or the dashboard. On the WROOM that meant
+   * a renderer that opened the same URL every few seconds for minutes -- the
+   * heap guard's census lines were the only sign anything was happening at all
+   * -- while the one line that named the cause ("Not enough memory left for
+   * the stream buffer") sat unread in status.error. Outside the lock, because
+   * the UART is slow and the status mutex is taken from the decode path.
+   */
+  if (error && state == RADIO_ERROR) LOGF("[radio] error: %s\n", error);
 }
 
 /// Picks a decoder from what the server said it was sending, falling back to
@@ -764,11 +837,34 @@ void runStream(const char *url, bool *stopped) {
   const uint32_t needed = floorNow + (secure ? STREAM_TLS_EXTRA : 0);
   const uint32_t heap = ESP.getFreeHeap();          // internal only
   const uint32_t block = ESP.getMaxAllocHeap();     // internal only
+
+  /*
+   * The small ring, on a board whose arena is internal, whenever the heap at
+   * this moment says the full one would leave too little to run on -- see
+   * STREAM_TIGHT_BELOW for the measurement behind the line. The saving is the
+   * difference between the two rings, and it comes off `needed` because the
+   * floor was built from the full ring; so this also rescues a start that the
+   * full ring alone would have had refused. Never on a WROVER, whose ring is
+   * in external RAM and costs the internal heap nothing.
+   */
+  const uint32_t tightSaving =
+      arenaElsewhere ? 0u : (uint32_t)(RING_BYTES_MIN - RING_BYTES_TIGHT);
+  const bool tight = !arenaElsewhere && heap < STREAM_TIGHT_BELOW;
+  const uint32_t neededNow = tight ? needed - tightSaving : needed;
+  if (tight) {
+    LOGF("[radio] %u B free: using the %u kB ring so the dashboard keeps room "
+         "to answer while this plays\n", (unsigned)heap,
+         (unsigned)(RING_BYTES_TIGHT / 1024));
+  }
   // The block floor exists for the arena, so it only applies while the arena is
   // coming out of the internal heap. A TLS context wants large pieces too, and
-  // STREAM_TLS_EXTRA above is what accounts for those.
-  const uint32_t blockFloor = arenaElsewhere ? 12000u : STREAM_BLOCK_FLOOR;
-  if (heap < needed || block < blockFloor) {
+  // STREAM_TLS_EXTRA above is what accounts for those. With the small ring the
+  // arena is a smaller block, and the floor follows it.
+  const uint32_t blockFloor =
+      arenaElsewhere ? 12000u
+                     : (tight ? (uint32_t)(RING_BYTES_TIGHT + READ_CHUNK + DECODE_CHUNK + 1024)
+                              : STREAM_BLOCK_FLOOR);
+  if (heap < neededNow || block < blockFloor) {
     char why[RADIO_TEXT_MAX];
     if (secure && heap >= floorNow) {
       // It would have fitted without the encryption, which makes the fix a
@@ -786,7 +882,7 @@ void runStream(const char *url, bool *stopped) {
     setState(RADIO_ERROR, why);
     LOGF("[radio] refusing to start a %s stream: %u B free, %u B largest block "
          "(needs %u / %u)\n", secure ? "https" : "http", (unsigned)heap,
-         (unsigned)block, (unsigned)needed, (unsigned)blockFloor);
+         (unsigned)block, (unsigned)neededNow, (unsigned)blockFloor);
     if (secure && heap >= floorNow) {
       LOGLN("[radio] the same station over plain http would fit. TLS needs "
             "another ~45 kB for its record buffers, and this chip does not "
@@ -936,12 +1032,35 @@ void runStream(const char *url, bool *stopped) {
    * memory. The socket has not been read from yet, so nothing is lost by
    * waiting.
    */
-  if (!arenaAcquire()) {
+  if (!arenaAcquire(tight)) {
     stream->end();
     delete stream;
     delete tls;
     setState(RADIO_ERROR, "Not enough memory left for the stream buffer");
     return;
+  }
+
+  /*
+   * The decoder's memory, checked before libhelix is allowed to want it. See
+   * DECODER_HEAP_NEED: the library's allocator spins forever on a failure, on
+   * this task, at a priority that takes loop() down with it. A refusal here
+   * is a sentence in status.error and a retry on the backoff; a refusal there
+   * is a board that needs its EN button pressed.
+   */
+  {
+    const uint32_t freeNow = ESP.getFreeHeap();
+    const uint32_t blockNow = ESP.getMaxAllocHeap();
+    if (freeNow < DECODER_HEAP_NEED || blockNow < DECODER_BLOCK_NEED) {
+      arenaRelease();
+      stream->end();
+      delete stream;
+      delete tls;
+      char why[RADIO_TEXT_MAX];
+      snprintf(why, sizeof(why), "Not enough memory for the decoder: %u free, %u block",
+               (unsigned)freeNow, (unsigned)blockNow);
+      setState(RADIO_ERROR, why);
+      return;
+    }
   }
 
   // Built here and destroyed at the end of the stream, so the ~30 kB the codec
