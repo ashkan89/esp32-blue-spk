@@ -1,3 +1,5 @@
+#include "product.h"
+#include "ota_guard.h"
 /*
  * Bluetooth speaker: ESP32 WROOM-32D + PCM5102A I2S DAC + 0.91" OLED
  *
@@ -420,6 +422,7 @@ class LoudVolumeControl : public A2DPVolumeControl {
      */
     int16_t *pcm = reinterpret_cast<int16_t *>(data);
     audio_eq_process(pcm, frameCount);
+    product_dsp(pcm, frameCount);
     voice_mix(pcm, frameCount);
 
     // The display taps the stream here, after shaping, so the meters show what
@@ -431,6 +434,7 @@ class LoudVolumeControl : public A2DPVolumeControl {
  protected:
   /// 0..127 used directly as the factor -> amplitude tracks the slider.
   void set_volume(uint8_t volume) override {
+    volume = product_volume_limit(volume);
     volumeFactor = (int32_t)(volume * OUTPUT_GAIN + 0.5f);
     ps_set_volume(volume);  // and the UI gets to draw the popup
   }
@@ -459,7 +463,22 @@ class LoudVolumeControl : public A2DPVolumeControl {
 };
 
 LoudVolumeControl volume_control;
-BluetoothA2DPSink a2dp_sink(i2s);
+class SpeakerSink : public BluetoothA2DPSink {
+ public:
+  using BluetoothA2DPSink::BluetoothA2DPSink;
+ protected:
+  void app_gap_callback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) override {
+    // Discovery alone is not admission control: reject new pairing challenges
+    // outside the physical pairing window, while stored bonds can reconnect.
+    if (!product_pairing_allowed()) {
+      if (event == ESP_BT_GAP_CFM_REQ_EVT) { esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, false); return; }
+      if (event == ESP_BT_GAP_PIN_REQ_EVT) { esp_bt_pin_code_t pin{}; esp_bt_gap_pin_reply(param->pin_req.bda, false, 0, pin); return; }
+      if (event == ESP_BT_GAP_KEY_REQ_EVT) { esp_bt_gap_ssp_passkey_reply(param->key_req.bda, false, 0); return; }
+    }
+    BluetoothA2DPSink::app_gap_callback(event, param);
+  }
+};
+SpeakerSink a2dp_sink(i2s);
 
 // -------------------------------------------------------------- melodies ----
 /*
@@ -521,11 +540,13 @@ static bool df_autoplay_pending;
 
 static const uint32_t TONE_CHUNK_FRAMES = 128;
 
+static uint8_t melodyVolume = 40;
 static void play_note(const Note &note) {
   static int16_t frames[TONE_CHUNK_FRAMES * 2];  // interleaved L/R
 
   const uint32_t total = (uint32_t)SAMPLE_RATE * note.ms / 1000;
   if (total == 0) return;
+  const float toneGain = product_volume_limit(melodyVolume) / 127.0f;
 
   // ~4 ms of fade at each end, or half the note if it is shorter than that.
   uint32_t fade = SAMPLE_RATE / 250;
@@ -550,7 +571,7 @@ static void play_note(const Note &note) {
             env = (float)(total - pos) / fade;
           }
         }
-        sample = (int16_t)(sinf(phase) * MELODY_AMPLITUDE * env);
+        sample = (int16_t)(sinf(phase) * MELODY_AMPLITUDE * env * toneGain);
         phase += step;
         if (phase >= TWO_PI) phase -= TWO_PI;
       }
@@ -789,6 +810,7 @@ static bool dac_busy() {
  * two are here because the melodies and the I2S channel are.
  */
 static void alarm_set_volume(uint8_t volume127) {
+  melodyVolume = product_volume_limit(volume127);
   management_media_action("volume", volume127);
 }
 
@@ -822,6 +844,8 @@ static void service_alarm_chime() {
 }
 
 static void alarm_stop_audio() {
+  product_noise_stop();
+  net_radio_stop();
   alarm_chime_active = false;
   management_media_action("pause", 0);
 }
@@ -910,7 +934,7 @@ static bool radio_command(const char *line) {
     } else if (a2dp_sink.is_connected()) {
       LOGLN("[bt] a phone is already connected; disconnect it first");
     } else {
-      a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
+      a2dp_sink.set_discoverability(product_pairing_allowed() ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
       LOGLN("[bt] discoverable now");
     }
     return true;
@@ -1129,7 +1153,7 @@ static void service_bluetooth_identity() {
   // above should have left us hidden, but "the speaker is invisible" is an
   // expensive failure to debug from the other end of a phone.
   if (!a2dp_sink.is_connected()) {
-    a2dp_sink.set_discoverability(ESP_BT_GENERAL_DISCOVERABLE);
+    a2dp_sink.set_discoverability(product_pairing_allowed() ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
     LOGLN("[bt] discoverable");
   }
 }
@@ -1145,7 +1169,7 @@ static void service_bluetooth_start() {
 
   const uint32_t heap_before = ESP.getFreeHeap();
   a2dp_sink.start(DEVICE_NAME);
-  a2dp_sink.set_volume(START_VOLUME);
+  a2dp_sink.set_volume(product_start_volume());
   bt_started = true;
   bt_started_at = millis();
   management_set_bt_active(true);
@@ -1414,7 +1438,8 @@ void setup() {
        (unsigned)((6u * cfg.buffer_count * cfg.buffer_size) /
                   (SAMPLE_RATE / 1000u * 4u)),
        (unsigned)SAMPLE_RATE);
-  if (!i2s.begin(cfg)) {
+  const bool audioReady = i2s.begin(cfg);
+  if (!audioReady) {
     LOGLN("[i2s] the output channel would not open; there will be no "
                    "sound. This is almost always a DMA allocation that failed.");
   }
@@ -1424,6 +1449,7 @@ void setup() {
   // reconfigured in the middle of an A2DP stream. Connection is asynchronous;
   // an unreachable network falls back to the setup AP after 15 seconds.
   management_begin(a2dp_sink);
+  product_begin();
   // The number that decides whether the rest of this boot can succeed: what is
   // left once Wi-Fi has taken its share. In Bluetooth mode the sink has not
   // taken its share yet.
@@ -1586,6 +1612,20 @@ void setup() {
   if (have_leds) leds_start();
 
   LOGLN("Type 'help' for the serial commands (clock, screens, radio).");
+  ota_health_begin(audioReady);
+}
+
+// Keep this scratch space out of loop()'s frame: HTTP/TLS handlers need that
+// stack while they run, but they never run concurrently with this helper.
+static void __attribute__((noinline)) service_soundscape() {
+  if (dac_busy() || voice_busy()) return;
+  int16_t soundscape[256 * 2];
+  size_t count = product_noise_render(soundscape, 256);
+  if (count) {
+    product_dsp(soundscape, count);
+    audio_probe_feed((const Frame *)soundscape, count);
+    i2s.write((const uint8_t *)soundscape, count * 4);
+  }
 }
 
 void loop() {
@@ -1622,8 +1662,20 @@ void loop() {
   // sees it running on the same pass rather than the next.
   alarm_loop();
   telemetry_loop();
+  product_loop();
+  if (product_take_focus_cue() && !dac_busy()) { melodyVolume = product_start_volume(); pending_melody = MELODY_ID_NOTIFY; }
+  service_soundscape();
+  if (bt_started) {
+    static int pairingState = -1;
+    const int next = product_pairing_allowed() ? 1 : 0;
+    if (next != pairingState) {
+      a2dp_sink.set_discoverability(next ? ESP_BT_GENERAL_DISCOVERABLE : ESP_BT_NON_DISCOVERABLE);
+      pairingState = next;
+    }
+  }
+  ota_health_tick();
   check_loop_stack();
 
   poll_console();
-  delay(10);
+  delay(product_noise_active() ? 1 : 10);
 }

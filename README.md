@@ -1,5 +1,7 @@
 # esp32-blue-spk
 
+Version 4 adds dashboard scenes/favorites, soundscapes, focus sessions, sunrise/wake, signed OTA and production tooling. **Internet radio stays enabled on WROOM.** See [the current operation and release guide](PRODUCTION.md) and [validation record](VALIDATION.md) for the new behavior and hardware qualification gates.
+
 Turns an **ESP32 WROOM-32D** into a Bluetooth audio receiver. Pair your phone,
 press play, and the audio comes out of the headphone jack on a **PCM5102A** I2S
 DAC board. It chimes when a phone connects or disconnects, and drives the DAC at
@@ -496,7 +498,8 @@ channel and never an audio decoder.
 
 | Target / profile | Wi-Fi + dashboard | Classic A2DP | DFPlayer | Internet radio | UPnP/DLNA | BLE control |
 |---|---|---|---|---|---|---|
-| WROOM: Wi-Fi + DFPlayer | on | off | SD / USB / PC card-reader | **not supported** | no | no |
+| WROOM: Wi-Fi + DFPlayer | on | off | SD / USB / PC card-reader | yes | yes (off by default) | no |
+| WROOM: Wi-Fi only | on | off | — | yes | yes (off by default) | no |
 | WROOM: Bluetooth audio | **completely off** | on | stopped | no | no | no |
 | WROVER: Wi-Fi only | on | off | — | yes | **yes** (off by default) | staged |
 | WROVER: Wi-Fi + DFPlayer | on | off | SD / USB / PC card-reader | yes | **yes** (off by default) | staged |
@@ -516,41 +519,16 @@ is not a memory workaround: the ESP32 supports Wi-Fi/Bluetooth coexistence in
 principle, and this project gives the antenna to one job at a time for
 predictable audio. **PSRAM does not change this.**
 
-The WROOM's third profile — Wi-Fi with no audio source — still exists, because
-it is where the boot-failure fallback lands and the dashboard has to be able to
-say so. It is reported by `/api/capabilities` with `"audio": false` rather than
-offered as a way to listen to something.
+### Internet radio on both boards
 
-### Internet radio is a WROVER feature
+Internet radio remains enabled on WROOM and WROVER. WROOM uses the existing
+bounded internal-memory buffers and decoder admission checks; WROVER can use
+PSRAM for larger buffering and live MP3 pause/rewind. Set `WROOM_ALLOW_RADIO=0`
+only for an explicitly reduced custom build. The default is `1`.
 
-On the WROOM it is **not in the image**. Not hidden, not disabled — absent:
-
-```
-$ xtensa-esp-elf-nm firmware.elf | grep -c net_radio      # WROOM
-0
-$ xtensa-esp-elf-nm firmware.elf | grep -ci helix         # WROOM
-0
-```
-
-`net_radio.cpp` compiles to nothing, the MP3 and AAC decoders go with it, and
-there is no endpoint, MQTT topic, alarm target or restored backup that can reach
-a radio that does not exist. That is worth about 170 KB of flash and 2.4 KB of
-static RAM on that target.
-
-To get the behaviour this firmware shipped with back — internet radio on the
-WROOM, exactly as it was — uncomment one line in `platformio.ini`:
-
-```ini
-[env:esp32_wroom_32d_16mb]
-build_flags =
-    ${env.build_flags}
-    ${wroom.build_flags}
-    -DWROOM_ALLOW_RADIO=1
-```
-
-Nothing was deleted. It fits — it is what runs today — but it fits with nothing
-to spare, and the note in `net_radio.cpp` about heap and TLS is worth reading
-before relying on it alongside the dashboard and an https station.
+The Wi-Fi profile therefore provides radio playback on WROOM as well. Bluetooth
+still requires its separate profile and restart. Stop streaming before a
+firmware update so TLS and flash operations have their required resources.
 
 ### Capabilities are enforced, not just hidden
 
@@ -1186,10 +1164,10 @@ mobile. On its first boot it creates a WPA2 setup network:
 | Setting | First-boot value |
 |---------|------------------|
 | Wi-Fi network | `esp32-blue-spk-XXXXXX` (the suffix is unique to the board) |
-| Wi-Fi password | `speaker-setup` |
+| Wi-Fi password | Unique device setup secret (OLED/provisioning label) |
 | Dashboard address | `http://192.168.4.1/` |
 | Dashboard user | `admin` |
-| Dashboard password | `admin` |
+| Dashboard password | Unique device setup secret (existing custom passwords preserved) |
 
 Connect to that network, open the address, sign in, then use **Wi-Fi → Scan
 networks** to join the speaker to your normal network. After it connects the
@@ -1563,7 +1541,7 @@ pio run -e esp32dev -t upload
 ```
 
 After that, use **Updates → Upload firmware** with
-`.pio/build/esp32dev/firmware.bin`. Do not upload `firmware.factory.bin`; that
+a board-specific signed `.spk` from `scripts/build_release.py`. Raw `firmware.bin` is for serial provisioning. Do not upload `firmware.factory.bin`; that
 combined image is only for a serial flash at address zero. An OTA write always
 targets the inactive slot and restarts only after `Update.end()` validates the
 complete ESP32 image.
@@ -1571,9 +1549,9 @@ complete ESP32 image.
 ### GitHub Releases updater
 
 Under **Settings → GitHub Releases**, enter `owner/repository` and an asset
-pattern such as `*.bin` or `speaker-*.bin`. The updater ignores bootloader,
+pattern `firmware-wroom.spk` or `firmware-wrover.spk`. The updater ignores bootloader,
 partition-table, LittleFS and SPIFFS images. Publish the normal PlatformIO
-`firmware.bin` as a release asset, then use **Check GitHub** and **Install
+signed `.spk` as a release asset, then use **Check GitHub** and **Install
 update**. Public repositories need no token; a fine-grained token can be saved
 for a private repository. GitHub API and release downloads are verified over TLS
 against the Mozilla root store — see **Trust anchors** below.
@@ -4442,7 +4420,7 @@ group — most of the pass criteria below are one line of that report.
 - [ ] **Power cycle during a settings write** — pull power repeatedly while
       saving from the dashboard. NVS should either keep the old value or take
       the new one; it must never fail to mount on the next boot.
-- [ ] **OTA**: upload `firmware.bin` from the dashboard, confirm it writes to
+- [ ] **OTA**: upload the board-specific signed `.spk` from the dashboard, confirm it writes to
       the *other* slot (`diag` → partitions, the `<-- running` marker moves).
 - [ ] Power-cycle mid-OTA. The old slot must still boot.
 

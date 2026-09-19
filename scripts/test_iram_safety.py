@@ -63,12 +63,12 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from toolchain_paths import packages, tool
 
 ROOT = Path(__file__).resolve().parent.parent
 BUILD = ROOT / ".pio" / "build"
-TOOLCHAIN = Path("C:/p/packages/toolchain-xtensa-esp-elf/bin")
-NM = TOOLCHAIN / "xtensa-esp-elf-nm.exe"
-LIBS = Path("C:/p/packages/framework-arduinoespressif32-libs/esp32")
+NM = tool("nm")
+LIBS = packages() / "framework-arduinoespressif32-libs/esp32"
 SECTIONS_LD = LIBS / "ld" / "sections.ld"
 
 # The short, readable list. Everything a cache-disabled routine plausibly
@@ -182,7 +182,7 @@ def main() -> int:
 
         iram = 0
         for line in subprocess.run(
-                [str(TOOLCHAIN / "xtensa-esp-elf-size.exe"), "-A", str(elf)],
+            [str(tool("size")), "-A", str(elf)],
                 capture_output=True, text=True).stdout.splitlines():
             if line.startswith(".iram0.vectors") or line.startswith(".iram0.text "):
                 iram += int(line.split()[1])

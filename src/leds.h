@@ -125,6 +125,9 @@ void leds_start();
 
 /// True if the driver is live.
 bool leds_present();
+uint32_t leds_output_errors();
+uint32_t leds_last_frame_ms();
+bool leds_power_saving();
 
 /// Applies a whole configuration. Safe from any task; takes effect on the next
 /// frame, which is at most 17 ms away.
@@ -186,6 +189,9 @@ bool leds_command(const char *line);
 inline bool leds_begin() { return false; }
 inline void leds_start() {}
 inline bool leds_present() { return false; }
+inline uint32_t leds_output_errors() { return 0; }
+inline uint32_t leds_last_frame_ms() { return 0; }
+inline bool leds_power_saving() { return false; }
 inline void leds_configure(const LedConfig &) {}
 inline void leds_get(LedConfig *out) { *out = LedConfig{}; }
 inline const char *leds_effect_name(uint8_t) { return "?"; }

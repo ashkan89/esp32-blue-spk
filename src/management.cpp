@@ -1,3 +1,6 @@
+#include "product.h"
+#include "time_shift.h"
+#include "ota_guard.h"
 #include "app_config.h"
 #include "board_caps.h"
 #include "management.h"
@@ -13,6 +16,7 @@
 #include <Update.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
+#include <detail/RequestHandler.h>
 #include <WiFi.h>
 #include <esp_bt.h>
 #include <esp_gap_bt_api.h>
@@ -160,6 +164,8 @@ BluetoothA2DPSink *sink;
 String stableDeviceName;
 String apName;
 bool apRunning;
+bool apExpired;
+uint32_t apOpenedAt;
 bool announcedIp;
 uint32_t wifiStartedAt;
 bool rebootPending;
@@ -308,10 +314,24 @@ void loadSettings(const char *fallbackName) {
   if (settings.apPassword.length() < 8) settings.apPassword = "speaker-setup";
   settings.adminPassword = prefs.getString("adminPass", "admin");
   if (!settings.adminPassword.length()) settings.adminPassword = "admin";
+  if (settings.apPassword == "speaker-setup" || settings.adminPassword == "admin") {
+    char provisioned[17];
+    snprintf(provisioned, sizeof(provisioned), "%08lx%08lx", (unsigned long)esp_random(), (unsigned long)esp_random());
+    if (settings.apPassword == "speaker-setup") { settings.apPassword = provisioned; prefs.putString("apPass", settings.apPassword); }
+    if (settings.adminPassword == "admin") { settings.adminPassword = provisioned; prefs.putString("adminPass", settings.adminPassword); }
+    // A factory/headless unit prints its label once, even in a quiet build.
+    Serial.begin(115200);
+    Serial.printf("PROVISION %012llX %s\n", ESP.getEfuseMac(), provisioned);
+    Serial.flush();
+#if !SERIAL_PORT_USED
+    Serial.end();
+#endif
+  }
   settings.deviceName = cleanDeviceName(prefs.getString("deviceName", fallbackName), fallbackName);
   if (settings.deviceName == "ESP32 Speaker") settings.deviceName = APP_NAME;
   settings.githubRepo = prefs.getString("ghRepo", DEFAULT_GITHUB_REPO);
   settings.githubAsset = prefs.getString("ghAsset", DEFAULT_GITHUB_ASSET);
+  if (settings.githubAsset == "*.bin") settings.githubAsset = DEFAULT_GITHUB_ASSET;
   settings.githubToken = prefs.getString("ghToken", "");
   settings.apAlways = prefs.getBool("apAlways", false);
   settings.dlnaEnabled = prefs.getBool("dlnaOn", false);
@@ -550,8 +570,47 @@ String colorText(uint32_t color) {
   return String(buf);
 }
 
+struct WebSession { char token[65]; uint32_t expires; } sessions[4]{};
+uint8_t nextSession;
+uint32_t loginWindow, loginBlockedUntil;
+uint8_t loginFailures;
+String incomingJson;
+bool incomingJsonReady;
+
+String randomSecret() {
+  char token[33];
+  for (unsigned i = 0; i < 4; ++i) snprintf(token + i * 8, 9, "%08lx", (unsigned long)esp_random());
+  return String(token);
+}
+bool sameOrigin() {
+  String host = server.hostHeader(); host.toLowerCase();
+  if (host.endsWith(":80")) host.remove(host.length() - 3);
+  if (host != WiFi.localIP().toString() && host != WiFi.softAPIP().toString() &&
+      host != settings.hostname && host != settings.hostname + ".local") return false;
+  String origin = server.header("Origin");
+  if (server.header("Sec-Fetch-Site") == "cross-site") return false;
+  return !origin.length() || origin == String("http://") + server.hostHeader();
+}
 bool authenticated() {
-  return server.authenticate("admin", settings.adminPassword.c_str());
+  if (!sameOrigin()) return false;
+  String authorization = server.header("Authorization");
+  if (authorization.startsWith("Bearer ")) {
+    authorization.remove(0, 7);
+    if (authorization.length() != 64) return false;
+    for (const auto &session : sessions) {
+      if ((int32_t)(session.expires - millis()) <= 0) continue;
+      uint8_t mismatch = 0;
+      for (unsigned i = 0; i < 64; ++i) mismatch |= authorization[i] ^ session.token[i];
+      if (!mismatch) return true;
+    }
+    return false;
+  }
+  const uint32_t now = millis();
+  if ((int32_t)(loginBlockedUntil - now) > 0) return false;
+  if (now - loginWindow > 60000) { loginWindow = now; loginFailures = 0; }
+  if (server.authenticate("admin", settings.adminPassword.c_str())) { loginFailures = 0; return true; }
+  if (++loginFailures >= 8) { loginBlockedUntil = now + 30000; loginFailures = 0; }
+  return false;
 }
 
 template <typename T>
@@ -582,11 +641,11 @@ bool requireAuth() {
 }
 
 bool readBody(JsonDocument &doc) {
-  if (!server.hasArg("plain")) {
+  if (!incomingJsonReady && !server.hasArg("plain")) {
     sendError(400, "Missing JSON request body");
     return false;
   }
-  const DeserializationError error = deserializeJson(doc, server.arg("plain"));
+  const DeserializationError error = deserializeJson(doc, incomingJsonReady ? incomingJson : server.arg("plain"), DeserializationOption::NestingLimit(8));
   if (error) {
     sendError(400, String("Invalid JSON: ") + error.c_str());
     return false;
@@ -746,7 +805,7 @@ bool isFirmwareAsset(const String &name) {
   // the application. They pass the 0xE9 magic-byte check, so an OTA would
   // happily write one into the app slot and then fail to boot from it. Only a
   // plain application image belongs here.
-  return lower.endsWith(".bin") && lower.indexOf("bootloader") < 0 &&
+  return lower.endsWith(".spk") && lower.indexOf("bootloader") < 0 &&
          lower.indexOf("partition") < 0 && lower.indexOf("littlefs") < 0 &&
          lower.indexOf("spiffs") < 0 && lower.indexOf("factory") < 0 &&
          lower.indexOf("merged") < 0;
@@ -915,21 +974,26 @@ bool flashFromStream(HTTPClient &http, String &error) {
             (unsigned)ESP.getFreeSketchSpace() + " B";
     return false;
   }
-  if (!Update.begin((size_t)contentLength, U_FLASH)) {
-    error = Update.errorString();
-    return false;
+  ota_package_begin();
+  auto &input = http.getStream();
+  uint8_t block[1024];
+  size_t received = 0;
+  uint32_t lastData = millis();
+  while (received < (size_t)contentLength) {
+    if (input.available()) {
+      const size_t n = input.readBytes(block, min(sizeof(block), (size_t)contentLength - received));
+      if (!n || !ota_package_write(block, n)) {
+        error = ota_package_error(); ota_package_abort(); return false;
+      }
+      received += n; lastData = millis();
+      updateProgress(received, contentLength);
+    } else if (millis() - lastData > 15000) {
+      error = "Firmware transfer timed out"; ota_package_abort(); return false;
+    }
+    delay(1);
   }
-  Update.onProgress(updateProgress);
-  const size_t written = Update.writeStream(http.getStream());
-  if (written != (size_t)contentLength) {
-    error = String("Transfer stopped after ") + (unsigned)written + " of " +
-            contentLength + " B: " + Update.errorString();
-    Update.abort();
-    return false;
-  }
-  if (!Update.end(true)) {
-    error = Update.errorString();
-    return false;
+  if (!ota_package_end()) {
+    error = ota_package_error(); ota_package_abort(); return false;
   }
   return true;
 }
@@ -1240,7 +1304,7 @@ void parkStation() {
 }
 
 void startAccessPoint() {
-  if (apRunning) return;
+  if (apRunning || (apExpired && !settings.apAlways)) return;
 
   // AP_STA is only worth its cost when the station is actually associated --
   // then the channel is settled and the AP simply shares it. Any other time the
@@ -1267,6 +1331,7 @@ void startAccessPoint() {
     return;
   }
 
+  apOpenedAt = millis();
   apClients = 0;
   // 300 ms beacons instead of the 100 ms default. A config page does not need
   // to be discovered three times a second, and the two thirds of beacon airtime
@@ -1394,8 +1459,10 @@ void handleStatus() {
   ps_snapshot(&p);
   JsonDocument doc;
   doc["ok"] = true;
+  product_status(doc["product"].to<JsonObject>());
   JsonObject fw = doc["firmware"].to<JsonObject>();
   fw["version"] = FW_VERSION;
+  fw["health"] = ota_health_state();
   fw["built"] = String(__DATE__) + " " + __TIME__;
   fw["runningPartition"] = esp_ota_get_running_partition()->label;
   fw["nextPartition"] = esp_ota_get_next_update_partition(nullptr)->label;
@@ -1586,6 +1653,9 @@ void handleStatus() {
   led["hearingAudio"] = leds_hearing_audio();
   led["resting"] = leds_resting();
   led["idleSeconds"] = leds_idle_ms() / 1000;
+  led["outputErrors"] = leds_output_errors();
+  led["lastFrameMs"] = leds_last_frame_ms();
+  led["powerSaving"] = leds_power_saving();
 
   /*
    * The radio, the tone stack and the alarm all appear in the status rather
@@ -1641,6 +1711,12 @@ void handleAuth() {
   JsonDocument doc;
   doc["ok"] = true;
   doc["defaultPassword"] = settings.adminPassword == "admin";
+  WebSession &session = sessions[nextSession++ % 4];
+  String token = randomSecret() + randomSecret();
+  strlcpy(session.token, token.c_str(), sizeof(session.token));
+  session.expires = millis() + 8u * 60u * 60u * 1000u;
+  doc["token"] = token;
+  doc["expiresSeconds"] = 28800;
   sendJson(doc);
 }
 
@@ -1681,6 +1757,11 @@ MediaTarget mediaTarget() {
 }
 
 bool mediaRadio(const String &action, int value) {
+  if (action == "toggle" && time_shift_command("toggle", 0)) return true;
+  if (action == "pause" && time_shift_command("pause", 0)) return true;
+  if (action == "play" && time_shift_command("resume", 0)) return true;
+  if (action == "rewind") return time_shift_command("rewind", 15);
+  if (action == "forward") return time_shift_command("live", 0);
   if (action == "play") {
     // Not a toggle: "play" from an automation that has just turned the amplifier
     // on has to mean start, whatever the speaker was doing a moment ago.
@@ -1773,7 +1854,7 @@ void handleMedia() {
   }
 
   const MediaTarget target = mediaTarget();
-  if (target == MEDIA_NONE) {
+  if (target == MEDIA_NONE && !product_noise_active()) {
     sendError(409, radio_mode_has_dfplayer(radioMode)
                        ? "The DFPlayer driver did not start in this boot; check "
                          "the serial log."
@@ -2434,6 +2515,7 @@ void handleSettingsSave() {
       return;
     }
     settings.adminPassword = password;
+    memset(sessions, 0, sizeof(sessions));
   }
   if (!body["githubRepo"].isNull()) settings.githubRepo = body["githubRepo"].as<String>();
   if (!body["githubAsset"].isNull()) settings.githubAsset = body["githubAsset"].as<String>();
@@ -2755,9 +2837,9 @@ void handleSettingsBackup() {
    * out -- so this deliberately does not go through readBody().
    */
   String passphrase;
-  if (server.hasArg("plain")) {
+  if ((incomingJsonReady || server.hasArg("plain"))) {
     JsonDocument request;
-    if (deserializeJson(request, server.arg("plain"))) {
+    if (deserializeJson(request, (incomingJsonReady ? incomingJson : server.arg("plain")))) {
       sendError(400, "Invalid JSON request body");
       return;
     }
@@ -2782,6 +2864,9 @@ void handleSettingsBackup() {
   // So the page, and anyone reading the file later, can tell at a glance which
   // of the two kinds of backup this is without decrypting anything.
   doc["encrypted"] = passphrase.length() > 0;
+  product_settings(doc["product"].to<JsonObject>());
+  JsonDocument catalog;
+  if (product_catalog_read(catalog)) doc["catalog"] = catalog.as<JsonVariantConst>();
 
   JsonObject s = doc["settings"].to<JsonObject>();
   s["hostname"] = settings.hostname;
@@ -2980,7 +3065,7 @@ void handleSettingsBackup() {
    * would arrive unauthenticated.
    */
   String body;
-  serializeJsonPretty(doc, body);
+  serializeJson(doc, body);
   char disposition[128];
   snprintf(disposition, sizeof(disposition),
            "attachment; filename=\"%s-settings.json\"",
@@ -3145,6 +3230,11 @@ void handleSettingsRestore() {
     }
   }
 
+  // Authenticate encrypted credentials before applying any imported state.
+  if (!body["product"].isNull() || !body["catalog"].isNull()) {
+    String error;
+    if (!product_restore(body["product"], body["catalog"], error)) { sendError(400, error); return; }
+  }
   /*
    * Applied key by key, and only where the key is present, so a file from an
    * older firmware -- or one somebody trimmed by hand -- restores what it
@@ -4672,7 +4762,8 @@ void handleUpdateAction(bool install) {
 }
 
 void handleUploadComplete() {
-  if (!requireAuth()) return;
+  // Authentication was checked before parsing the body. An admitted upload
+  // may finish after its browser session expires.
   const bool ok = browserUploadOk;
   JsonDocument reply;
   reply["ok"] = ok;
@@ -4687,10 +4778,10 @@ void handleUploadComplete() {
   }
 }
 
-void handleUploadChunk() {
-  if (!authenticated()) return;
-  HTTPUpload &upload = server.upload();
-  if (upload.status == UPLOAD_FILE_START) {
+void handleUploadChunk(HTTPRaw &upload) {
+  static uint32_t startedAt;
+  if (upload.status == RAW_START) {
+    startedAt = millis();
     browserUploadAccepted = false;
     browserUploadOk = false;
     browserUploadTotal = (size_t)strtoul(
@@ -4703,41 +4794,48 @@ void handleUploadChunk() {
       return;
     }
     if (sink && sink->is_connected()) sink->pause();
+    if (net_radio_active()) {
+      strlcpy(browserUploadError, "Stop radio playback before installing firmware", sizeof(browserUploadError));
+      return;
+    }
+    product_noise_stop();
     updateSet("uploading", "Receiving firmware from browser", true);
     updateProgress(0, browserUploadTotal);
-    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
-      strlcpy(browserUploadError, Update.errorString(), sizeof(browserUploadError));
-      updateSet("error", Update.errorString(), false);
-    } else browserUploadAccepted = true;
-  } else if (upload.status == UPLOAD_FILE_WRITE) {
-    if (browserUploadAccepted && !Update.hasError()) {
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        strlcpy(browserUploadError, Update.errorString(), sizeof(browserUploadError));
-        updateSet("error", Update.errorString(), false);
+    ota_package_begin();
+    browserUploadAccepted = true;
+  } else if (upload.status == RAW_WRITE) {
+    if (millis() - startedAt > 300000) {
+      if (browserUploadAccepted) { ota_package_abort(); updateSet("error", "Upload timed out", false); }
+      browserUploadAccepted = false; server.client().stop(); return;
+    }
+    if (browserUploadAccepted) {
+      if (!ota_package_write(upload.buf, upload.currentSize)) {
+        strlcpy(browserUploadError, ota_package_error(), sizeof(browserUploadError));
+        updateSet("error", ota_package_error(), true);
       } else {
-        updateProgress(Update.progress(), browserUploadTotal);
+        updateProgress(ota_package_received(), browserUploadTotal);
       }
     }
-  } else if (upload.status == UPLOAD_FILE_END) {
-    if (browserUploadAccepted && Update.end(true)) {
-      updateProgress(Update.progress(), Update.size());
+  } else if (upload.status == RAW_END) {
+    if (browserUploadAccepted && ota_package_end()) {
+      updateProgress(ota_package_received(), browserUploadTotal);
       updateSet("success", "Upload installed; restarting", false);
       browserUploadOk = true;
     } else {
       if (browserUploadAccepted)
-        strlcpy(browserUploadError, Update.errorString(), sizeof(browserUploadError));
-      updateSet("error", browserUploadError, false);
+        strlcpy(browserUploadError, ota_package_error(), sizeof(browserUploadError));
+      if (browserUploadAccepted) updateSet("error", browserUploadError, false);
     }
-  } else if (upload.status == UPLOAD_FILE_ABORTED) {
-    if (browserUploadAccepted) Update.abort();
+  } else if (upload.status == RAW_ABORTED) {
+    if (browserUploadAccepted) { ota_package_abort(); updateSet("error", "Upload cancelled", false); }
     strlcpy(browserUploadError, "Upload cancelled", sizeof(browserUploadError));
-    updateSet("error", "Upload cancelled", false);
   }
 }
 
 // Wipes settings and Bluetooth bonds. Shared by the dashboard action and the
 // BOOT-button hold, so the two can never drift apart. The caller reboots.
 void factoryReset() {
+  product_reset();
   prefs.clear();
 
   // Bonds belong to Bluedroid, which is only running in Bluetooth mode. Ask it
@@ -4857,9 +4955,58 @@ void startResponder() {
   MDNS.addServiceTxt("http", "tcp", "version", FW_VERSION);
 }
 
+class FirmwareRequestHandler : public RequestHandler {
+ public:
+  bool canHandle(WebServer &, HTTPMethod method, const String &uri) override {
+    return method == HTTP_POST && uri == "/api/update/upload";
+  }
+  bool canRaw(WebServer &, const String &) override { return true; }
+  void raw(WebServer &, const String &, HTTPRaw &data) override { handleUploadChunk(data); }
+  bool handle(WebServer &, HTTPMethod, const String &) override { handleUploadComplete(); return true; }
+};
+
+class JsonRequestHandler : public RequestHandler {
+ public:
+  JsonRequestHandler(const char *path, WebServer::THandlerFunction fn) : path_(path), fn_(fn) {}
+  bool canHandle(WebServer &, HTTPMethod method, const String &uri) override {
+    if (method != HTTP_POST || uri != path_) return false;
+    incomingJson = ""; incomingJsonReady = false; rejected_ = false; return true;
+  }
+  bool canRaw(WebServer &, const String &) override { return true; }
+  void raw(WebServer &web, const String &, HTTPRaw &raw) override {
+    if (raw.status == RAW_START) {
+      incomingJson = ""; incomingJsonReady = true;
+      if (!authenticated()) { rejected_ = true; web.send(401, "application/json", "{\"error\":\"Sign in required\"}"); web.client().stop(); return; }
+      const int bytes = web.clientContentLength();
+      if (path_ == "/api/settings/restore" && net_radio_active()) {
+        rejected_ = true; web.send(409, "application/json", "{\"error\":\"Stop radio before restoring settings\"}"); web.client().stop(); return;
+      }
+      if (bytes < 0 || (size_t)bytes > limit() || !incomingJson.reserve(bytes + 1)) {
+        rejected_ = true; web.send(413, "application/json", "{\"error\":\"Request exceeds device limits\"}"); web.client().stop();
+      }
+    } else if (raw.status == RAW_WRITE && !rejected_) {
+      if (incomingJson.length() + raw.currentSize > limit()) { rejected_ = true; web.client().stop(); }
+      else incomingJson.concat((const char *)raw.buf, raw.currentSize);
+    } else if (raw.status == RAW_ABORTED) { rejected_ = true; incomingJson = ""; }
+  }
+  bool handle(WebServer &web, HTTPMethod, const String &) override {
+    if (!rejected_) {
+      if (web.header("Content-Type").startsWith("multipart/")) web.send(415, "application/json", "{\"error\":\"Use JSON\"}");
+      else fn_();
+    }
+    incomingJson = ""; incomingJsonReady = false; return true;
+  }
+ private:
+  size_t limit() const { return path_ == "/api/settings/restore" ? 49152 : 16384; }
+  String path_; WebServer::THandlerFunction fn_; bool rejected_ = false;
+};
+void jsonRoute(const char *path, WebServer::THandlerFunction fn) {
+  server.addHandler(new JsonRequestHandler(path, fn));
+}
+
 void configureRoutes() {
-  const char *requestHeaders[] = {"X-Firmware-Size"};
-  server.collectHeaders(requestHeaders, 1);
+  const char *requestHeaders[] = {"X-Firmware-Size", "Authorization", "Origin", "Sec-Fetch-Site", "Content-Type"};
+  server.collectHeaders(requestHeaders, 5);
   server.on("/", HTTP_GET, [] {
     server.sendHeader("Cache-Control", "no-cache");
     server.sendHeader("Content-Encoding", "gzip");
@@ -4871,40 +5018,60 @@ void configureRoutes() {
     server.send_P(200, "image/svg+xml", DASHBOARD_ICON);
   });
   server.on("/api/auth", HTTP_GET, handleAuth);
+  server.on("/api/product", HTTP_GET, [] {
+    if (!requireAuth()) return;
+    JsonDocument doc; product_settings(doc.to<JsonObject>()); sendJson(doc);
+  });
+  jsonRoute("/api/product", [] {
+    if (!requireAuth()) return;
+    JsonDocument doc; if (!readBody(doc)) return;
+    String error;
+    if (!product_command(doc.as<JsonVariantConst>(), error)) { sendError(400, error); return; }
+    JsonDocument reply; reply["ok"] = true; sendJson(reply);
+  });
+  server.on("/api/catalog", HTTP_GET, [] {
+    if (!requireAuth()) return;
+    JsonDocument doc; if (!product_catalog_read(doc)) doc.to<JsonArray>(); sendJson(doc);
+  });
+  server.on("/api/support", HTTP_GET, [] {
+    if (!requireAuth()) return;
+    JsonDocument doc; product_support(doc.to<JsonObject>());
+    server.sendHeader("Content-Disposition", "attachment; filename=speaker-support.json"); sendJson(doc);
+  });
   server.on("/api/status", HTTP_GET, handleStatus);
   // Unauthenticated: hardware and feature set only, and the login page needs
   // it before there is a session. See the note on handleCapabilities().
   server.on("/api/capabilities", HTTP_GET, handleCapabilities);
-  server.on("/api/media", HTTP_POST, handleMedia);
+  jsonRoute("/api/media", handleMedia);
   server.on("/api/devices", HTTP_GET, handleDevices);
-  server.on("/api/devices", HTTP_POST, handleDeviceAction);
+  jsonRoute("/api/devices", handleDeviceAction);
   server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
-  server.on("/api/wifi", HTTP_POST, handleWifiSave);
+  jsonRoute("/api/wifi", handleWifiSave);
   server.on("/api/settings", HTTP_GET, handleSettingsGet);
-  server.on("/api/settings", HTTP_POST, handleSettingsSave);
-  server.on("/api/settings/backup", HTTP_POST, handleSettingsBackup);
-  server.on("/api/settings/restore", HTTP_POST, handleSettingsRestore);
-  server.on("/api/dfplayer", HTTP_POST, handleDfPlayer);
+  jsonRoute("/api/settings", handleSettingsSave);
+  jsonRoute("/api/settings/backup", handleSettingsBackup);
+  jsonRoute("/api/settings/restore", handleSettingsRestore);
+  jsonRoute("/api/dfplayer", handleDfPlayer);
   server.on("/api/dfplayer/library", HTTP_GET, handleDfLibrary);
-  server.on("/api/battery", HTTP_POST, handleBattery);
-  server.on("/api/display", HTTP_POST, handleDisplay);
-  server.on("/api/leds", HTTP_POST, handleLeds);
-  server.on("/api/clock", HTTP_POST, handleClock);
+  jsonRoute("/api/battery", handleBattery);
+  jsonRoute("/api/display", handleDisplay);
+  jsonRoute("/api/leds", handleLeds);
+  jsonRoute("/api/clock", handleClock);
   server.on("/api/audio", HTTP_GET, handleAudioGet);
-  server.on("/api/audio", HTTP_POST, handleAudioSave);
+  jsonRoute("/api/audio", handleAudioSave);
   server.on("/api/dlna", HTTP_GET, handleDlnaGet);
-  server.on("/api/dlna", HTTP_POST, handleDlnaPost);
+  jsonRoute("/api/dlna", handleDlnaPost);
   server.on("/api/radio", HTTP_GET, handleRadioGet);
-  server.on("/api/radio", HTTP_POST, handleRadioPost);
+  jsonRoute("/api/radio", handleRadioPost);
   server.on("/api/alarms", HTTP_GET, handleAlarmsGet);
-  server.on("/api/alarms", HTTP_POST, handleAlarmsPost);
+  jsonRoute("/api/alarms", handleAlarmsPost);
   server.on("/api/telemetry", HTTP_GET, handleTelemetry);
   server.on("/api/mqtt", HTTP_GET, handleMqttGet);
-  server.on("/api/mqtt", HTTP_POST, handleMqttPost);
+  jsonRoute("/api/mqtt", handleMqttPost);
   server.on("/api/update/check", HTTP_POST, [] { handleUpdateAction(false); });
   server.on("/api/update/install", HTTP_POST, [] { handleUpdateAction(true); });
-  server.on("/api/update/upload", HTTP_POST, handleUploadComplete, handleUploadChunk);
-  server.on("/api/system", HTTP_POST, handleSystem);
+  server.addHandler(new FirmwareRequestHandler());
+  jsonRoute("/api/system", handleSystem);
   server.onNotFound([] {
     if (server.uri().startsWith("/api/")) sendError(404, "API endpoint not found");
     else server.sendHeader("Location", "/", true), server.send(302, "text/plain", "");
@@ -4913,6 +5080,15 @@ void configureRoutes() {
 }
 
 }  // namespace
+
+// Called by the project-local parser before any request body is allocated.
+extern "C" bool speaker_http_body_allowed(const char *uri, const char *type, size_t bytes) {
+  if (strncmp(uri, "/api/", 5) || !authenticated()) return false;
+  if (!strcmp(uri, "/api/update/upload"))
+    return !strcmp(type, "application/octet-stream") && bytes >= 172 && bytes <= ESP.getFreeSketchSpace() + 172;
+  const size_t limit = !strcmp(uri, "/api/settings/restore") ? 49152 : 16384;
+  return bytes <= limit && (!bytes || String(type).startsWith("application/json"));
+}
 
 const char *management_device_name(const char *fallback) {
   if (!stableDeviceName.length()) loadSettings(fallback);
@@ -4980,8 +5156,9 @@ bool management_update_busy() { return updateSnapshot().busy; }
 
 bool management_media_action(const char *action, int value) {
   if (!action || !action[0]) return false;
+  if (product_noise_control(action, value)) return true;
   const String what(action);
-  const int level = constrain(value, 0, 127);
+  const int level = product_volume_limit(constrain(value, 0, 127));
   switch (mediaTarget()) {
     case MEDIA_RADIO: return mediaRadio(what, level);
     case MEDIA_DF: return mediaDfPlayer(what, level);
@@ -5053,7 +5230,7 @@ void management_df_defaults(uint8_t *source, uint8_t *volume, uint8_t *eq,
                            uint8_t *loop, uint8_t *loopFolder, bool *autoplay) {
   if (!stableDeviceName.length()) loadSettings(APP_NAME);
   if (source) *source = settings.dfSource;
-  if (volume) *volume = settings.dfVolume;
+  if (volume) *volume = min(settings.dfVolume, (uint8_t)((uint16_t)product_start_volume() * DF_VOLUME_MAX / 127));
   if (eq) *eq = settings.dfEq;
   if (loop) *loop = settings.dfLoop;
   if (loopFolder) *loopFolder = settings.dfLoopFolder;
@@ -5341,6 +5518,10 @@ void management_loop() {
        (WiFi.status() != WL_CONNECTED &&
         millis() - wifiStartedAt > FIRST_CONNECT_GRACE_MS))) {
     startAccessPoint();
+  }
+  if (apRunning && !settings.apAlways && !apClients && millis() - apOpenedAt > 600000) {
+    apExpired = true; stopAccessPoint("setup window expired");
+    if (settings.ssid.length()) WiFi.begin(settings.ssid.c_str(), settings.wifiPassword.c_str());
   }
   serviceStationRetry();
   serviceStartupUpdateCheck();

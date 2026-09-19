@@ -14,6 +14,7 @@
 
 #include "app_config.h"
 #include "voice.h"
+#include "product.h"
 
 #include <Arduino.h>
 #include <string.h>
@@ -217,7 +218,8 @@ bool nextOutputSample(int16_t *out) {
 
 /// The announcement's own level, as a 0..4096 multiplier.
 inline int32_t clipGain() {
-  const uint8_t volume = configured ? config.volume : 66;
+  const uint8_t volume = min((uint8_t)(configured ? config.volume : 66),
+                             (uint8_t)((uint16_t)product_volume_limit(127) * 100 / 127));
   return ((int32_t)volume * DUCK_UNITY) / 100;
 }
 

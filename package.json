@@ -1,0 +1,10 @@
+{
+  "name": "esp32-blue-spk-dashboard",
+  "private": true,
+  "version": "4.0.0",
+  "scripts": {
+    "test": "playwright test",
+    "preview": "node scripts/preview_web.cjs"
+  },
+  "devDependencies": { "@playwright/test": "1.63.0" }
+}

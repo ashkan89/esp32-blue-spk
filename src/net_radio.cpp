@@ -1,21 +1,12 @@
+#include "time_shift.h"
+#include "product.h"
 #include "app_config.h"
 #include "net_radio.h"
 
 #include "heap_guard.h"
 
-/*
- * The whole of this file is a WROVER capability.
- *
- * net_radio.h supplies inline stubs when CAP_NET_RADIO is 0, so nothing that
- * calls into here needs to know. The guard is here rather than in the build
- * system so that the decoders come with it: libhelix is referenced only from
- * this translation unit, and with the unit empty the linker drops the MP3 and
- * AAC decoders, the HTTP stream reader and the TLS client along with it. That
- * is about forty kilobytes of flash and, more to the point, every code path
- * that could have opened a socket to a station.
- *
- * -DWROOM_ALLOW_RADIO=1 compiles it back in for a WROOM, unchanged.
- */
+// Radio is enabled on both supported boards. Only WROVER uses PSRAM history.
+// CAP_NET_RADIO retains a compile-time stub option for custom hardware builds.
 #if CAP_NET_RADIO
 
 #include <Arduino.h>
@@ -616,6 +607,7 @@ void loadStations() {
 
   volume127 = (uint8_t)prefs.getUChar("vol", 90);
   if (volume127 > 127) volume127 = 127;
+  volume127 = min(volume127, product_start_volume());
   autostart = prefs.getBool("auto", false);
 
   const size_t want = sizeof(RadioStation) * RADIO_MAX_STATIONS;
@@ -748,7 +740,9 @@ class RadioOutput : public AudioOutput {
   void reset() {
     channels = 2;
     lastRate = 0;
+    fadeIn();
   }
+  void fadeIn() { fadeRemaining = fadeTotal = (lastRate ? lastRate : 44100) / 25; }
 
  private:
   /// Frames of the mono-to-stereo scratch buffer. Small on purpose: this is
@@ -757,6 +751,7 @@ class RadioOutput : public AudioOutput {
   int16_t stereo[STEREO_FRAMES * 2];
   uint16_t channels = 2;
   uint32_t lastRate = 0;
+  uint32_t fadeRemaining = 0, fadeTotal = 1;
 
   void emit(int16_t *frames, size_t count) {
     // Volume first, so the equaliser's soft knee is the last thing in the chain
@@ -769,7 +764,13 @@ class RadioOutput : public AudioOutput {
       }
     }
     audio_eq_process(frames, count);
+    product_dsp(frames, count);
     voice_mix(frames, count);
+    for (size_t i = 0; i < count && fadeRemaining; ++i, --fadeRemaining) {
+      const int32_t gain = fadeTotal - fadeRemaining;
+      frames[2*i] = (int32_t)frames[2*i] * gain / fadeTotal;
+      frames[2*i+1] = (int32_t)frames[2*i+1] * gain / fadeTotal;
+    }
     audio_probe_feed((const Frame *)frames, (uint16_t)count);
     i2s->write((const uint8_t *)frames, count * 4);
   }
@@ -784,6 +785,7 @@ void ringClear() {
 }
 
 size_t ringWrite(const uint8_t *data, size_t len) {
+  time_shift_append(data, len);
   size_t written = 0;
   while (written < len && ringUsed < ringBytes) {
     const size_t space = ringBytes - ringUsed;
@@ -887,7 +889,10 @@ void adoptMetadata() {
   if (!metaDirty) return;
   metaDirty = false;
   statusLock();
-  if (metaTitle[0]) copyString(status.title, sizeof(status.title), metaTitle);
+  if (metaTitle[0]) {
+    time_shift_metadata(metaTitle);
+    if (!time_shift_active()) copyString(status.title, sizeof(status.title), metaTitle);
+  }
   if (metaName[0]) copyString(status.name, sizeof(status.name), metaName);
   if (metaGenre[0]) copyString(status.genre, sizeof(status.genre), metaGenre);
   statusUnlock();
@@ -993,8 +998,8 @@ void runStream(const char *url, bool *stopped) {
       STREAM_HEAP_FLOOR - (uint32_t)(RING_BYTES_MIN + READ_CHUNK + DECODE_CHUNK) +
       arenaInternal;
   const uint32_t needed = floorNow + (secure ? STREAM_TLS_EXTRA : 0);
-  const uint32_t heap = ESP.getFreeHeap();          // internal only
-  const uint32_t block = ESP.getMaxAllocHeap();     // internal only
+  const uint32_t heap = usableFree();
+  const uint32_t block = usableLargest();
 
   /*
    * Admit the stream on the small ring, on a board whose arena is internal,
@@ -1067,21 +1072,13 @@ void runStream(const char *url, bool *stopped) {
       setState(RADIO_ERROR, "Out of memory for the TLS connection");
       return;
     }
-    /*
-     * No certificate verification for a radio stream, deliberately.
-     *
-     * The firmware updater checks the full Mozilla root bundle and must: it
-     * writes executable code into flash, and a stream that can be substituted
-     * there owns the device. A radio station is public audio, unauthenticated,
-     * that anybody can fetch -- the worst a successful attacker achieves is
-     * that you hear the wrong music. Verifying it costs a chain walk and the
-     * allocations that go with it, at the exact moment this chip has none to
-     * spare.
-     *
-     * That is a real trade and it is worth writing down rather than leaving as
-     * a missing line: this connection is encrypted but not authenticated.
-     */
-    tls->setInsecure();
+    // Verify station certificates by default. Legacy compatibility is an
+    // explicit owner setting; firmware updates always verify their server.
+    if (product_verified_tls()) {
+      extern const uint8_t bundleStart[] asm("_binary_x509_crt_bundle_start");
+      extern const uint8_t bundleEnd[] asm("_binary_x509_crt_bundle_end");
+      tls->setCACertBundle(bundleStart, (size_t)(bundleEnd - bundleStart));
+    } else tls->setInsecure();
     stream->setClient(*tls);
   }
 
@@ -1321,11 +1318,20 @@ void runStream(const char *url, bool *stopped) {
   output.reset();
   heap_guard_mark("radio: decoder->begin(), where libhelix allocates");
   decoder->begin();
+  // AudioTools' wrapper returns true even when the Helix driver failed.
+  // The driver's active flag is the authoritative result after allocation.
+  if (!static_cast<bool>(*codec)) {
+    decoder->end(); delete decoder; delete codec;
+    arenaRelease(); stream->end(); delete stream; delete tls;
+    setState(RADIO_ERROR, "Decoder allocation failed; memory was safely released");
+    return;
+  }
   heap_guard_mark("radio: decoder allocated");
   LOGF("[radio] %s decoder in (%u B); %u B usable heap left, %u B largest\n",
        aac ? "AAC" : "MP3", (unsigned)decoderCost, (unsigned)usableFree(),
        (unsigned)usableLargest());
 
+  time_shift_begin(!aac && stream->contentLength() <= 0, status.bitrate);
   id3 = Id3Skip{};
   ringClear();
   setState(RADIO_BUFFERING);
@@ -1346,6 +1352,13 @@ void runStream(const char *url, bool *stopped) {
       break;
     }
 
+    if (time_shift_active()) {
+      ringTail = ringHead; ringUsed = 0; // History owns playback; keep receiving.
+      if (time_shift_service()) {
+        output.fadeIn(); decoder->end(); decoder->begin();
+        if (!static_cast<bool>(*codec)) { setState(RADIO_ERROR, "Not enough memory to restart decoder"); break; }
+      }
+    }
     // Fill.
     const size_t space = ringBytes - ringUsed;
     /*
@@ -1369,6 +1382,11 @@ void runStream(const char *url, bool *stopped) {
     }
 
     adoptMetadata();
+    const size_t buffered = time_shift_active() ? time_shift_available() : ringUsed;
+    if (time_shift_active()) {
+      const char *title = time_shift_title();
+      statusLock(); copyString(status.title, sizeof(status.title), title); statusUnlock();
+    }
 
     /*
      * A file ends; a station does not.
@@ -1384,7 +1402,7 @@ void runStream(const char *url, bool *stopped) {
     const int contentLength = stream->contentLength();
     const bool eof = contentLength > 0 &&
                      (long)stream->totalRead() >= (long)contentLength;
-    if (eof && ringUsed == 0) {
+    if (eof && buffered == 0) {
       LOGF("[radio] end of the media after %u bytes\n", (unsigned)contentLength);
       finished = true;
       break;
@@ -1408,12 +1426,13 @@ void runStream(const char *url, bool *stopped) {
     if (now - lastPercentAt >= 100) {
       lastPercentAt = now;
       statusLock();
-      status.bufferPercent = (uint8_t)(ringUsed * 100 / ringBytes);
+      status.bufferPercent = (uint8_t)min((size_t)100, buffered * 100 / ringBytes);
       statusUnlock();
     }
 
+    if (time_shift_paused()) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
     if (!decoding) {
-      if (ringUsed < prebuffer && !eof) {
+      if (buffered < prebuffer && !eof) {
         // Nothing to do but wait for the socket. Yielding here rather than
         // spinning is what keeps the Wi-Fi task fed while the buffer fills.
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -1430,7 +1449,7 @@ void runStream(const char *url, bool *stopped) {
       voice_say(VOICE_RADIO_PLAYING, VOICE_CAT_RADIO);
     }
 
-    if (ringUsed == 0) {
+    if (buffered == 0) {
       // The buffer ran dry with the stream still open: the connection cannot
       // keep up. Go back to filling rather than feeding the decoder silence,
       // which is what makes the difference audible as a pause rather than as a
@@ -1443,7 +1462,7 @@ void runStream(const char *url, bool *stopped) {
       continue;
     }
 
-    const size_t take = ringRead(feed, DECODE_CHUNK);
+    const size_t take = time_shift_active() ? time_shift_read(feed, DECODE_CHUNK) : ringRead(feed, DECODE_CHUNK);
     /*
      * This blocks inside the I2S write, which is what paces the whole loop --
      * when the decoder produces audio. When it does not (bytes it cannot sync
@@ -1469,6 +1488,7 @@ void runStream(const char *url, bool *stopped) {
    * them goes away, and it is the difference between a speaker that reconnects
    * for a week and one that runs out of heap overnight.
    */
+  time_shift_end();
   decoder->end();
   delete decoder;
   delete codec;
@@ -1509,6 +1529,7 @@ void radioTask(void *) {
       statusUnlock();
       copyString(url, sizeof(url), request.url);
       backoff = RECONNECT_MIN_MS;
+      product_event("station-primary", status.station);
       if (!request.play) setState(RADIO_IDLE);
     }
 
@@ -1537,7 +1558,16 @@ void radioTask(void *) {
     if (status.reconnects == 0) voice_say(VOICE_RADIO_FAILED, VOICE_CAT_RADIO);
     statusLock();
     status.reconnects++;
+    const uint32_t failures = status.reconnects;
+    const int station = status.station;
     statusUnlock();
+    if (station >= 0 && failures >= 2) {
+      char backup[192]; product_station_alternative(station, backup, sizeof(backup));
+      if (backup[0]) {
+        copyString(url, sizeof(url), failures % 2 == 0 ? backup : request.url);
+        product_event(failures % 2 == 0 ? "station-alternative" : "station-primary", station);
+      }
+    }
     setState(RADIO_RECONNECTING);
 
     const uint32_t waitUntil = millis() + backoff;
@@ -1739,14 +1769,17 @@ void net_radio_loop() {
   net_radio_snapshot(&s);
 
   static RadioState lastState = RADIO_IDLE;
+  static bool lastPaused;
   static uint32_t lastTitleHash;
 
   const bool live = s.state == RADIO_PLAYING || s.state == RADIO_BUFFERING;
-  if (s.state != lastState) {
+  const bool paused = time_shift_paused();
+  if (s.state != lastState || paused != lastPaused) {
     lastState = s.state;
+    lastPaused = paused;
     ps_set_source_connection(live || s.state == RADIO_CONNECTING, s.name);
-    ps_set_streaming(s.state == RADIO_PLAYING);
-    ps_set_playback(s.state == RADIO_PLAYING ? PS_PLAYING : PS_STOPPED);
+    ps_set_streaming(s.state == RADIO_PLAYING && !paused);
+    ps_set_playback(paused ? PS_PAUSED : s.state == RADIO_PLAYING ? PS_PLAYING : PS_STOPPED);
   }
 
   if (live) {
@@ -1838,7 +1871,7 @@ bool net_radio_step_station(bool forward) {
 }
 
 void net_radio_set_volume(uint8_t volume) {
-  const uint8_t want = volume > 127 ? 127 : volume;
+  const uint8_t want = product_volume_limit(volume > 127 ? 127 : volume);
   if (want == volume127) return;
   volume127 = want;
   volumeDirty = true;

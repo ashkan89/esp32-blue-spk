@@ -22,13 +22,10 @@
  * analyser and the DAC both see the equalised stream), and the radio task for
  * network audio. Both are audio paths where blocking is not allowed, so:
  *
- *   - it never allocates, never locks, and never calls into anything that does;
- *   - coefficients are recomputed on the *caller's* task -- the web handler --
- *     into a shadow set, and the audio task adopts them at a block boundary by
- *     flipping one index. A torn read is impossible because nothing is ever
- *     written to the set the audio task is reading;
- *   - with every gain at zero and no preamp it returns immediately, so an owner
- *     who never opens the Sound page pays one comparison per buffer.
+ *   - processing never allocates and only locks for a bounded snapshot copy;
+ *   - writers design coefficients outside the lock and publish only if their
+ *     configuration revision is still current;
+ *   - the audio task owns history and copies coefficients at block boundaries.
  *
  * Arithmetic. Single-precision float, because this chip has an FPU and a biquad
  * is five multiplies and four adds. Five bands, two channels, 44100 frames a
@@ -127,9 +124,7 @@ const char *audio_eq_preset_name(uint8_t preset);
 /// has its own tone control and this one is not in the sample path at all.
 uint8_t audio_eq_hw_preset(uint8_t preset);
 
-/// Installs a configuration. Safe from any task: the coefficients are computed
-/// here, on the caller, into the set the audio task is *not* reading, and the
-/// swap is a single store. Clamps everything it is given.
+/// Publishes a complete configuration snapshot. Safe from control tasks.
 void audio_eq_configure(const EqConfig &cfg);
 
 /// The live configuration, as stored.

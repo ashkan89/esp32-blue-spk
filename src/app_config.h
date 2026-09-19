@@ -1,4 +1,5 @@
 #pragma once
+#include "board_caps.h"
 
 #ifndef APP_NAME
 #define APP_NAME "esp32-blue-spk"
@@ -7,7 +8,7 @@
 // Keep this in sync with GitHub release tags. A leading "v" on the release is
 // ignored when the dashboard compares versions.
 #ifndef FW_VERSION
-#define FW_VERSION "3.1.1"
+#define FW_VERSION "4.0.0"
 #endif
 
 // Can be overridden with build flags, for example:
@@ -17,7 +18,11 @@
 #endif
 
 #ifndef DEFAULT_GITHUB_ASSET
-#define DEFAULT_GITHUB_ASSET "*.bin"
+#if BOARD_IS_WROVER
+#define DEFAULT_GITHUB_ASSET "firmware-wrover.spk"
+#else
+#define DEFAULT_GITHUB_ASSET "firmware-wroom.spk"
+#endif
 #endif
 
 #ifndef MANAGEMENT_ENABLED

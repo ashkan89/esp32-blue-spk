@@ -1,5 +1,17 @@
+#include "product.h"
+#include "ota_guard.h"
+#include "management.h"
+#include <esp_sleep.h>
+#include <driver/rtc_io.h>
 #include "app_config.h"
 #include "power.h"
+
+// The stock WROVER framework leaves too little IRAM for its deep-sleep path
+// alongside PSRAM and Bluetooth. Keep timer wake using the existing low-clock
+// standby loop there. WROOM has enough IRAM for hardware deep sleep.
+#ifndef SPEAKER_DEEP_SLEEP
+#define SPEAKER_DEEP_SLEEP (!BOARD_IS_WROVER)
+#endif
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -255,13 +267,15 @@ bool power_woke_from_sleep() {
   static bool checked, woke;
   if (!checked) {
     checked = true;
-    woke = esp_reset_reason() == ESP_RST_SW && g_wokeMagic == WOKE_MAGIC;
+    woke = esp_reset_reason() == ESP_RST_DEEPSLEEP ||
+           (esp_reset_reason() == ESP_RST_SW && g_wokeMagic == WOKE_MAGIC);
     g_wokeMagic = 0;  // read once: the next boot is not this one
   }
   return woke;
 }
 
 bool power_sleep_now() {
+  if (management_update_busy() || ota_health_pending()) return false;
   if (!power_sleep_possible()) {
     LOGLN("[power] no wake button compiled in; refusing to stand by");
     return false;
@@ -270,6 +284,7 @@ bool power_sleep_now() {
   g_sleeping = true;
 
   LOGF("[power] standby; wake on GPIO%d\n", (int)PIN_UI_BUTTON);
+  const uint32_t scheduledWake = product_wake_seconds();
 
   /*
    * Say so first, and on the panel rather than only on a serial port nobody is
@@ -344,7 +359,29 @@ bool power_sleep_now() {
    * MACs need 80 MHz to keep time with the air. Nothing is left that needs to
    * be fast: one GPIO read every fifty milliseconds.
    */
+  // Deep sleep preserves the RTC timer and wakes before the next alarm's
+  // sunrise window. GPIO0 stays an active-low wake input; setup handles release.
+#if SPEAKER_DEEP_SLEEP
+  if (PIN_UI_BUTTON >= 0 && rtc_gpio_is_valid_gpio((gpio_num_t)PIN_UI_BUTTON)) {
+    const uint32_t releaseDeadline = millis() + 10000;
+    while (digitalRead(PIN_UI_BUTTON) == LOW && (int32_t)(releaseDeadline - millis()) > 0) delay(10);
+    if (digitalRead(PIN_UI_BUTTON) == LOW) {
+      // A stuck button must not create an immediate wake/reboot loop.
+      if (scheduledWake) {
+        esp_sleep_enable_timer_wakeup((uint64_t)scheduledWake * 1000000ULL);
+        esp_deep_sleep_start();
+      }
+    } else {
+    rtc_gpio_pullup_en((gpio_num_t)PIN_UI_BUTTON);
+    rtc_gpio_pulldown_dis((gpio_num_t)PIN_UI_BUTTON);
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_UI_BUTTON, 0);
+    if (scheduledWake) esp_sleep_enable_timer_wakeup((uint64_t)scheduledWake * 1000000ULL);
+    esp_deep_sleep_start();
+    }
+  }
+#endif
   setCpuFrequencyMhz(10);
+  const uint32_t timedWakeAt = millis() + scheduledWake * 1000u;
 
   LOGFLUSH();
 
@@ -362,6 +399,7 @@ bool power_sleep_now() {
   constexpr uint32_t WAKE_HOLD_MS = 400;
   uint32_t downSince = 0;
   for (;;) {
+    if (scheduledWake && (int32_t)(millis() - timedWakeAt) >= 0) break;
     if (digitalRead(PIN_UI_BUTTON) == LOW) {
       if (downSince == 0) downSince = millis();
       if (millis() - downSince >= WAKE_HOLD_MS) break;

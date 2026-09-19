@@ -113,6 +113,18 @@
 
 #pragma once
 
+// Optional controls. GPIO34..39 need external pull-ups. Both encoder pins must
+// be supplied; physical_controls.cpp rejects conflicts with existing wiring.
+#ifndef PIN_ENCODER_A
+#define PIN_ENCODER_A -1
+#endif
+#ifndef PIN_ENCODER_B
+#define PIN_ENCODER_B -1
+#endif
+#ifndef PIN_PLAY_BUTTON
+#define PIN_PLAY_BUTTON -1
+#endif
+
 #include <stdint.h>
 
 // For BOARD_TARGET, which the DFPlayer UART pins below are keyed on. This is

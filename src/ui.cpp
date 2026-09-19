@@ -1,3 +1,4 @@
+#include "product.h"
 #include "ui.h"
 
 #include <Arduino.h>
@@ -138,7 +139,7 @@ enum UiScreen : uint8_t {
 
 static UiScreen cur_screen = SCR_CLOCK;
 static uint32_t screen_since;
-static bool carousel_paused;
+static bool carousel_paused = true;
 static uint8_t spectrum_style;  // 0 bars, 1 mirrored, 2 matrix
 
 // Requests from the serial console, which arrives on the Arduino task. They are
@@ -1634,6 +1635,11 @@ static void poll_button(uint32_t now) {
     if (held >= UI_BTN_LONG_MS) {
       carousel_paused = !carousel_paused;
     } else if (held > 25) {  // anything shorter is contact bounce
+      static uint32_t lastTap;
+      static uint8_t taps;
+      if (now - lastTap > 500) taps = 0;
+      lastTap = now;
+      if (++taps == 3) { product_request_favorite(); taps = 0; }
       req_next = true;
     }
   }

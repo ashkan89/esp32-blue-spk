@@ -149,16 +149,9 @@
  */
 
 /*
- * Internet radio: a WROVER feature by default.
- *
- * The WROOM can do it -- it does today, and the arrangement that makes it fit
- * is documented at length in net_radio.cpp -- but it fits with nothing to
- * spare, and the product this firmware is being shaped into asks the WROOM to
- * be two predictable things instead: Wi-Fi with the DFPlayer, or Bluetooth.
- *
- * The existing behaviour has not been deleted, only moved behind a switch.
- * Build with -DWROOM_ALLOW_RADIO=1 and the WROOM has internet radio back,
- * exactly as it does now, with the Wi-Fi-only radio mode it has always had.
+ * Internet radio is enabled on both targets. WROOM keeps the existing small
+ * internal-memory streaming path; WROVER additionally offers PSRAM time shift.
+ * A custom memory-constrained build can explicitly set WROOM_ALLOW_RADIO=0.
  */
 #ifndef WROOM_ALLOW_RADIO
 #define WROOM_ALLOW_RADIO 1

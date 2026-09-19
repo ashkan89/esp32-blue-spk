@@ -3,6 +3,14 @@
 !.vscode/extensions.json
 CMakeListsPrivate.txt
 scripts/__pycache__/
+node_modules/
+test-results/
+playwright-report/
+.venv-test/
+*.pem
+*.key
+dist/
+__pycache__/
 
 # Left behind by a custom_sdkconfig build, which the pioarduino platform drives
 # through CMake and the ESP-IDF build system. Regenerated, never edited by hand,

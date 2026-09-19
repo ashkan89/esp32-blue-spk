@@ -1,3 +1,4 @@
+#include "product.h"
 #include "app_config.h"
 #include "df_player.h"
 
@@ -1091,6 +1092,7 @@ bool df_player_advertise_stop() { return frame(CMD_ADVERT_STOP); }
 
 bool df_player_set_volume_raw(uint8_t volume) {
   if (volume > DF_VOLUME_MAX) volume = DF_VOLUME_MAX;
+  volume = min(volume, (uint8_t)((uint16_t)product_volume_limit(127) * DF_VOLUME_MAX / 127));
   {
     Locked lock;
     if (lock.held) status.volume = volume;
@@ -1117,7 +1119,7 @@ uint8_t df_player_volume() {
 }
 
 bool df_player_volume_step(bool up) {
-  return frame(up ? CMD_VOL_UP : CMD_VOL_DOWN);
+  return df_player_set_volume(constrain((int)df_player_volume() + (up ? 4 : -4), 0, 127));
 }
 
 bool df_player_set_eq(uint8_t eq) {
