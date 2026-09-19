@@ -200,7 +200,32 @@ static I2SConfig make_i2s_config() {
   cfg.channels = 2;
   cfg.bits_per_sample = 16;
   cfg.i2s_format = I2S_STD_FORMAT;
-  cfg.buffer_count = 6;    // keep buffer_count * buffer_size <= 4092
+  /*
+   * How much DMA to claim, which is a different answer in each radio mode.
+   *
+   * These two multiply into dma_frame_num, and dma_desc_num stays at 6, so the
+   * bytes actually held are 6 * (buffer_count * buffer_size) -- 18 kB at the
+   * figures below, about 104 ms at 44.1 kHz. In Bluetooth mode that is right
+   * and it is free: Wi-Fi is off, the dashboard is not there, and nothing else
+   * wants the internal heap.
+   *
+   * In a Wi-Fi mode it is neither. The same memory has to cover the dashboard,
+   * an MP3 decoder (32.5 kB, measured), the jitter buffer and the UPnP
+   * renderer's working regions, on a WROOM that has about 100 kB of heap once
+   * the station is up -- and 104 ms of DMA buys nothing there that the jitter
+   * buffer is not already buying. Nine kilobytes of DMA is worth more as heap.
+   *
+   * Halved rather than cut to the bone: 52 ms is still several times what the
+   * decoder's write cadence needs, and it is the DMA's job to smooth that
+   * cadence, not the network's -- the network is the ring's problem.
+   *
+   * A WROVER in a Wi-Fi mode does not need the saving (its ring and the
+   * renderer's block are in external RAM) but takes it anyway, so that both
+   * boards run the same audio path in the same mode. 52 ms is not a compromise
+   * on either.
+   */
+  const bool network_mode = radio_mode_has_wifi(management_stored_radio_mode());
+  cfg.buffer_count = network_mode ? 3 : 6;  // keep count * size <= 4092
   cfg.buffer_size = 512;
   cfg.use_apll = true;
   cfg.auto_clear = true;   // emit silence on underrun, never replay a stale buffer
@@ -1384,6 +1409,11 @@ void setup() {
    * not a duplication.
    */
   auto cfg = make_i2s_config();
+  LOGF("[i2s] %u x %u B of DMA (~%u ms at %u Hz)\n",
+       (unsigned)cfg.buffer_count, (unsigned)cfg.buffer_size,
+       (unsigned)((6u * cfg.buffer_count * cfg.buffer_size) /
+                  (SAMPLE_RATE / 1000u * 4u)),
+       (unsigned)SAMPLE_RATE);
   if (!i2s.begin(cfg)) {
     LOGLN("[i2s] the output channel would not open; there will be no "
                    "sound. This is almost always a DMA allocation that failed.");

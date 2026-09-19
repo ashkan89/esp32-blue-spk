@@ -176,7 +176,8 @@ static const uint16_t POWER_SLEEP_AFTER_S_DEFAULT = 1800;
  *                unconditionally rather than after a timeout (ui.cpp)
  *   the Wi-Fi    modem sleep on and transmit power reduced, which costs some
  *                latency on the dashboard and nothing else
- *   the LED      the indicator is left dark between states
+ *   the LED      the indicator is held dark, whatever its own mode in Settings
+ *                says -- including "always on" (status_led.h)
  *
  * All four come back the moment saving ends, at whatever they were set to
  * before: saving never writes a setting, it only overrides one.

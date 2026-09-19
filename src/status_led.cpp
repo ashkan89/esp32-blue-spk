@@ -25,6 +25,19 @@ bool ledActiveHigh = true;
 volatile uint8_t baseState = LED_BOOT;
 volatile bool muted;
 
+// The owner's policy. Single-byte and single-word stores from the settings
+// side, loads from the tick; see the note on blipSlots for why that is enough.
+volatile uint8_t ledMode = STATUS_LED_MODE_ON;
+volatile uint32_t afterMs = (uint32_t)STATUS_LED_AFTER_S_DEFAULT * 1000UL;
+volatile uint32_t lastEventAt;
+volatile bool resting;
+
+/// Patterns that must outlast the timeout. Neither outlasts the mute or
+/// STATUS_LED_MODE_OFF; see the header.
+bool urgent(uint8_t state) {
+  return state == LED_UPDATING || state == LED_FAULT;
+}
+
 /*
  * The blip counter, and the one thing here that needs a lock.
  *
@@ -67,6 +80,9 @@ void status_led_begin(uint8_t pin, bool active_high) {
 
 void status_led_state(StatusLedState state) {
   if (state >= LED_STATE_COUNT) return;
+  // A change of pattern is the indicator's whole reason to exist, so it is an
+  // event; the same pattern set again every loop is not.
+  if ((uint8_t)state != baseState) lastEventAt = millis();
   baseState = (uint8_t)state;
 }
 
@@ -80,6 +96,7 @@ void status_led_blip(uint8_t pulses) {
   portENTER_CRITICAL(&blip_mux);
   if (slots > blipSlots) blipSlots = slots;
   portEXIT_CRITICAL(&blip_mux);
+  lastEventAt = millis();
 }
 
 void status_led_mute(bool on) {
@@ -88,18 +105,69 @@ void status_led_mute(bool on) {
   // Coming back, the next slot redraws from the pattern; going away, the pin is
   // taken low here rather than waiting up to 125 ms for a slot that says so.
   if (on && ledPin != 0xFF) drive(false);
+  // Saving ending is worth seeing, and an indicator that stays dark because its
+  // timeout ran out while it was muted is not.
+  if (!on) lastEventAt = millis();
 }
 
 bool status_led_muted() { return muted; }
 
+void status_led_configure(StatusLedMode mode, uint16_t after_seconds) {
+  if (mode >= STATUS_LED_MODE_COUNT) mode = STATUS_LED_MODE_ON;
+  if (after_seconds < STATUS_LED_AFTER_S_MIN) after_seconds = STATUS_LED_AFTER_S_MIN;
+  if (after_seconds > STATUS_LED_AFTER_S_MAX) after_seconds = STATUS_LED_AFTER_S_MAX;
+  ledMode = (uint8_t)mode;
+  afterMs = (uint32_t)after_seconds * 1000UL;
+  lastEventAt = millis();
+}
+
+StatusLedMode status_led_mode() { return (StatusLedMode)ledMode; }
+
+uint16_t status_led_after_s() { return (uint16_t)(afterMs / 1000UL); }
+
+void status_led_note_activity() { lastEventAt = millis(); }
+
+bool status_led_present() { return ledPin != 0xFF; }
+
+bool status_led_resting() { return resting; }
+
 void status_led_tick() {
   if (ledPin == 0xFF) return;
-  if (muted) {
+  if (muted || ledMode == STATUS_LED_MODE_OFF) {
+    resting = false;
     drive(false);
     return;
   }
 
   const uint32_t now = millis();
+
+  /*
+   * The timeout, before the blip: a blip refreshes lastEventAt when it is
+   * raised, so it can never arrive with the timer already expired, and the
+   * check is therefore one comparison rather than a special case.
+   */
+  if (ledMode == STATUS_LED_MODE_TIMEOUT && !urgent(baseState) &&
+      (now - lastEventAt) >= afterMs) {
+    if (!resting) {
+      resting = true;
+      // Any half-finished blip is dropped rather than resumed later: a burst
+      // of flashes that arrives minutes after its event means nothing.
+      portENTER_CRITICAL(&blip_mux);
+      blipSlots = 0;
+      portEXIT_CRITICAL(&blip_mux);
+    }
+    drive(false);
+    return;
+  }
+  if (resting) {
+    resting = false;
+    // Back from dark: start the pattern from its first slot so the eye sees a
+    // whole cycle rather than the tail of one, and do not try to catch up on
+    // the slots that were skipped while resting. Parked one slot behind so the
+    // first bit is drawn now rather than 125 ms from now.
+    slot = 15;
+    lastSlotAt = now - SLOT_MS;
+  }
 
   // Read and decrement in one critical section, so a blip raised from a radio
   // callback between the two cannot be overwritten by the store.

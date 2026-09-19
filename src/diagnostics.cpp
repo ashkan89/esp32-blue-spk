@@ -368,9 +368,14 @@ void print_report() {
                                         ? "available on BOOT"
                                         : "unavailable (no wake button)");
   LOGF(", idle for %u s\n", (unsigned)(power_idle_ms() / 1000));
-  LOGF("  status led  %s, muted %s\n",
-                ui_present() ? "GPIO2 pattern" : "GPIO2 pattern (only indicator)",
-                yes_no(status_led_muted()));
+  {
+    static const char *const MODES[] = {"off", "always on", "timed"};
+    const uint8_t m = (uint8_t)status_led_mode();
+    LOGF("  status led  %s, mode %s (%u s), muted %s, resting %s\n",
+         ui_present() ? "GPIO2 pattern" : "GPIO2 pattern (only indicator)",
+         m < 3 ? MODES[m] : "?", (unsigned)status_led_after_s(),
+         yes_no(status_led_muted()), yes_no(status_led_resting()));
+  }
 
   // --- flash layout ---------------------------------------------------------
   LOGLN(F("--- partitions -------------------------------------------"

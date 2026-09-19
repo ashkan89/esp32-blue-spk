@@ -1213,7 +1213,7 @@ Twelve pages:
 | **Wi-Fi** | scanning and joining a network |
 | **Home Assistant** | the MQTT broker, and what the speaker publishes |
 | **Updates** | the A/B firmware updater |
-| **Settings** | identity, access, the OLED, power saving, standby, the battery gauge, backup and restore |
+| **Settings** | identity, access, the OLED, power saving, the indicator LED, standby, the battery gauge, backup and restore |
 
 Pages that do not apply to the running mode say so and explain how to get to one
 where they do, rather than showing dead controls — the Devices page in a mode
@@ -1997,6 +1997,22 @@ running: two on a phone connecting or a Wi-Fi client joining, three on a
 disconnect, one on a track change. Override `PIN_STATUS_LED` or
 `STATUS_LED_ACTIVE_HIGH` from `build_flags` for boards that wire it differently.
 
+**Settings → Power → Indicator LED** decides whether any of that is shown. Three
+modes, the same shape as the panel and the ring: **Off** (never lit), **Always
+on** (the default), and **Timed** (lit for a while after something happens, then
+dark until the next event). An event is a change of pattern, a phone connecting,
+a track change, the BOOT button, or anything done on the dashboard — the same
+definition standby counts down from — and the timeout runs from ten seconds to
+twelve hours. Two patterns ignore the timeout because they must not go quiet:
+*writing flash* and *update failed*. Nothing ignores **Off**.
+
+Power saving sits above all of this. Whenever saving is on — chosen outright,
+engaged by the battery falling to the threshold, or on the way into standby —
+the indicator is held dark whatever this setting says, including *Always on*,
+and the card says which of the three is responsible for a dark LED. The setting
+is never rewritten: when saving ends the indicator comes back as it was, and
+lights up for one timeout so the change is visible.
+
 
 ### Persian, Arabic, and other scripts
 
@@ -2397,7 +2413,8 @@ guessing at a percentage that does not exist.
   reason the mode is worth having at all.
 - **the panel** — held off, the same ~15 mA the blanking modes get back, taken
   at once rather than after a timeout.
-- **the indicator LED** — held dark between states.
+- **the indicator LED** — held dark, whatever its own mode in **Settings →
+  Power → Indicator LED** says, *Always on* included.
 - **Wi-Fi** — modem sleep on and transmit power at 11 dBm instead of 19.5, which
   costs some dashboard latency and nothing else. Skipped entirely when no radio
   is up, which is every Bluetooth-only boot.

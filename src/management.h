@@ -71,6 +71,22 @@ const char *management_device_name(const char *fallback);
 /// The mode this boot is running in. Available after management_begin().
 RadioMode management_radio_mode();
 
+/*
+ * The stored mode, readable BEFORE management_begin() has run.
+ *
+ * There is exactly one caller and one reason: I2S has to be started before
+ * either radio (see the note at its begin() in main.cpp), and how much DMA it
+ * should claim depends on which of them is about to run. Bluetooth has the
+ * whole heap to itself and takes the generous buffer; a Wi-Fi mode is going to
+ * spend the same memory on the dashboard, the decoder and the UPnP renderer.
+ *
+ * Reads NVS directly and has no side effects beyond opening the settings, which
+ * management_device_name() has already done by then. If the boot sentinel later
+ * forces the mode elsewhere it can only force it TOWARDS Wi-Fi, so the answer
+ * here is never less conservative than the truth.
+ */
+RadioMode management_stored_radio_mode();
+
 /// The next one in the cycle, for the BOOT button and the console:
 /// Wi-Fi -> Bluetooth -> DFPlayer -> Wi-Fi.
 RadioMode management_next_mode();
@@ -188,6 +204,7 @@ bool management_led_state(StatusLedState *out);
 #else
 inline const char *management_device_name(const char *fallback) { return fallback; }
 inline RadioMode management_radio_mode() { return RADIO_MODE_BLUETOOTH; }
+inline RadioMode management_stored_radio_mode() { return RADIO_MODE_BLUETOOTH; }
 inline RadioMode management_next_mode() { return RADIO_MODE_BLUETOOTH; }
 inline const char *management_mode_name(RadioMode) { return "Bluetooth"; }
 inline void management_switch_mode(RadioMode) {}

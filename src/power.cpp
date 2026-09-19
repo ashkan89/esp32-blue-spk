@@ -240,7 +240,12 @@ void power_configure_sleep(SleepMode mode, uint16_t after_seconds) {
   g_activeAt = millis();
 }
 
-void power_note_activity() { g_activeAt = millis(); }
+void power_note_activity() {
+  g_activeAt = millis();
+  // The indicator's timeout runs from the same events, for the same reason
+  // ui_wake() feeds this one: one definition of "the owner did something".
+  status_led_note_activity();
+}
 
 uint32_t power_idle_ms() { return millis() - g_activeAt; }
 

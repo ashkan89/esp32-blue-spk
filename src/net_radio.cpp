@@ -117,10 +117,25 @@ size_t prebufferBytes() {
   return pct < PREBUFFER_MAX_BYTES ? pct : PREBUFFER_MAX_BYTES;
 }
 
-/// How much is read from the socket in one go: two MTUs. Larger reads made no
-/// measurable difference to the buffer level and every byte of this is resident
-/// for the whole stream.
+/*
+ * How much is read from the socket in one go.
+ *
+ * Two MTUs where there is external RAM to hold them: larger reads made no
+ * measurable difference to the buffer level, and every byte of this is
+ * resident for the whole stream.
+ *
+ * One MTU on a board without it, and the halving is worth 2,920 bytes rather
+ * than 1,460 -- the same number sizes the arena's socket chunk AND the buffer
+ * ICYStream keeps inside itself. On a WROOM in Wi-Fi mode with the dashboard
+ * and the UPnP renderer up, that is most of the difference between a stream
+ * the decoder fits beside and one it does not. A read is still a whole segment,
+ * so nothing is read more often than the network delivers it.
+ */
+#if BOARD_EXPECTS_PSRAM
 const size_t READ_CHUNK = 1460 * 2;
+#else
+const size_t READ_CHUNK = 1460;
+#endif
 
 /// How much encoded audio is handed to the decoder at a time. Small enough that
 /// the socket gets looked at often, large enough to amortise the call.
@@ -159,26 +174,103 @@ const uint32_t STREAM_HEAP_FLOOR = 70000;
 const uint32_t STREAM_BLOCK_FLOOR = 26000;
 
 /*
- * What the decoder must find AFTER the connection is up and the arena is in.
+ * What the decoder needs AFTER the connection is up and the arena is in.
  *
- * This check exists because libhelix's allocator does not fail: its OOM path
- * (utils/Allocator.h, both the default and the ESP32 variant) is a LOGE line
- * followed by `while(true);`. MP3InitDecoder() makes eight allocations, the
- * largest around 8.7 kB (the subband state), and on the WROOM with the
- * renderer and dashboard resident the seventh or eighth of them is where the
- * heap ran out -- after which the radio task, which outranks loop() on the
- * same core, spun forever. The console froze, the dashboard froze, the
- * renderer stopped answering, and the only way out was EN (COM3, 2026-09-08:
- * "libhelix - allocateation failed for 8708 bytes", then "loop() has not run
- * for 13 s", radio task state running, radio state still connecting).
+ * These two numbers used to BE the check, and that is the shape of the bug
+ * this file spent two days on. libhelix's allocator does not fail: its OOM
+ * path (utils/Allocator.h, every variant) is a LOGE line followed by
+ * `while(true);`. A bare spin -- on the radio task, which is pinned to loop()'s
+ * core at a higher priority, so loop() never runs again. The board does not
+ * panic and does not reboot: the console, the dashboard, the display and the
+ * renderer all stop together and the only way out is the EN button.
  *
- * So the decoder is not constructed unless its memory is visibly there. The
- * numbers are the measured table above (~29 kB of state in eight pieces plus
- * 7 kB of frame and PCM buffers) with a little room, and the block figure is
- * the largest single piece with the same room.
+ * A free-heap figure and a largest-block figure cannot predict that, because
+ * the decoder does not ask for one block. It asks for about ten, the largest
+ * of them a little under nine kilobytes, and a heap that clears both
+ * thresholds can still fail on the fourth. Measured on COM3 on 2026-09-13, a
+ * WROOM with the renderer up:
+ *
+ *     [ledger] before the codec: 40800 free, 19444 block
+ *     libhelix - allocateation failed for 5120 bytes
+ *
+ * 800 bytes over the old DECODER_HEAP_NEED, twice the old DECODER_BLOCK_NEED,
+ * and the board was gone. So the gate is decoderMemoryFits() below, which asks
+ * the heap the question it is actually going to be asked.
+ *
+ * What survives here is not a check but a target: how much runStream() leaves
+ * unspent for the decoder when it chooses the ring, so that the probe a few
+ * lines later usually says yes. Being a little wrong costs a smaller jitter
+ * buffer or one refused start, not a board.
+ *
+ * The MP3 figure is measured. With the probe in and the renderer lending its
+ * regions back, a WROOM got the decoder in and the probe reported the cost
+ * itself: 32,476 bytes, in about ten pieces (COM3, 2026-09-13). 36,000 is that
+ * with room. And the reason 40,800 free was not enough on the run before was
+ * never the total -- it was that the largest free block had fallen to 19,444
+ * and the pieces would not fit in it. Which is exactly the thing a number
+ * cannot see and decoderMemoryFits() can.
+ *
+ * AAC is not measured here because nothing in the test material was AAC. Its
+ * state is larger than MP3's and its PCM buffer is 8 kB rather than 5, so the
+ * figure is scaled from the MP3 measurement; the probe is what actually
+ * decides, so an error costs a ring size.
  */
-const uint32_t DECODER_HEAP_NEED = 40000;
-const uint32_t DECODER_BLOCK_NEED = 10000;
+const uint32_t DECODER_RESERVE_MP3 = 36000;
+const uint32_t DECODER_RESERVE_AAC = 44000;
+
+/*
+ * And what has to survive the decoder, on a board with no external RAM.
+ *
+ * The ring is chosen so that this much is still free once everything is in.
+ * It is not slack: the dashboard's WebServer allocates a receive buffer per
+ * request, lwIP allocates a pbuf per segment, and the UPnP renderer takes its
+ * working regions (a little under eight kilobytes, in six pieces) every time a
+ * controller polls it -- which, while something is playing, is about once a
+ * second. A stream that starts by spending the last of the heap is a stream
+ * that plays for ten seconds and then takes the board down with it, in
+ * somebody else's code and with somebody else's error message.
+ *
+ * 22,000 is measured rather than chosen. The soak on 2026-09-13 crashed twice
+ * with roughly nine kilobytes of byte-addressable heap left -- once in newlib's
+ * float formatter, once in the network stack -- and ran clean above twenty.
+ */
+const uint32_t STREAM_WORKING_RESERVE = 22000;
+
+/*
+ * Free heap, counted the way the things that need it will spend it.
+ *
+ * ESP.getFreeHeap() is heap_caps_get_free_size(MALLOC_CAP_INTERNAL), and on a
+ * classic ESP32 that includes the leftover of the IRAM pool -- about five
+ * kilobytes here, reachable only by aligned 32-bit instructions. Nothing that
+ * runs after this point can put a byte in it: not a pbuf, not the dashboard's
+ * receive buffer, not the renderer's working regions, not newlib's float
+ * formatter. Sizing a reserve against a number that includes it means
+ * reserving five kilobytes that are not there, and what that looks like in
+ * practice is
+ *
+ *     assert failed: mprec.c:783 (Balloc succeeded)
+ *
+ * -- newlib asserting inside printf because a malloc for a float conversion
+ * failed. A panic and a reboot, from a log line (COM3, 2026-09-13).
+ *
+ * So the arithmetic below asks for MALLOC_CAP_8BIT too. The older floors in
+ * this file are deliberately left on ESP.getFreeHeap(): they were calibrated
+ * against that number, and making them five kilobytes stricter would refuse
+ * streams that have been playing for months.
+ */
+uint32_t usableFree() {
+  return (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
+uint32_t usableLargest() {
+  return (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL |
+                                                    MALLOC_CAP_8BIT);
+}
+
+/// The smallest ring this firmware will play through. About half a second at
+/// 128 kbps -- thin for an internet station on a bad evening, which is why it
+/// is a floor and not a default, and ample for the LAN sources a UPnP
+/// controller hands over, which is when it actually gets used.
+const size_t RING_BYTES_FLOOR = 8 * 1024;
 
 /*
  * Below this much free internal heap at Play, a board without PSRAM takes the
@@ -330,7 +422,7 @@ Id3Skip id3;
 RadioStation *stations;
 uint8_t stationCount;
 
-bool arenaAcquire(bool tight = false) {
+bool arenaAcquire(size_t ringWant) {
   heap_guard_mark("radio: sizing the jitter buffer");
   if (arena) return true;
 
@@ -344,9 +436,12 @@ bool arenaAcquire(bool tight = false) {
    * plain malloc() and a fixed constant.
    */
   const size_t fixed = READ_CHUNK + DECODE_CHUNK;
-  // The floor is the smallest ring this stream has agreed to live with; see
-  // RING_BYTES_TIGHT for when runStream() asks for the smaller one.
-  const size_t floor = (tight ? RING_BYTES_TIGHT : RING_BYTES_MIN) + fixed;
+  // The floor is the ring runStream() has decided this stream can afford. On a
+  // board with no external RAM board_buffer_budget() grants exactly the floor
+  // and nothing above it -- INTERNAL_RESERVE sees to that -- so this parameter
+  // IS the ring there. On a WROVER the floor is never reached and the ring
+  // comes out of external RAM at RING_BYTES_PSRAM, unchanged.
+  const size_t floor = ringWant + fixed;
   const size_t budget = board_buffer_budget(RING_BYTES_PSRAM + fixed, floor);
   if (!budget) return false;
 
@@ -371,6 +466,69 @@ bool arenaAcquire(bool tight = false) {
        (unsigned)(arenaBytes / 1024), arenaInPsram ? "PSRAM" : "internal RAM",
        (unsigned)(ringBytes / 1024), (unsigned)(ringBytes / 16000));
   return true;
+}
+
+/*
+ * Whether the heap can actually serve the decoder -- asked by taking the
+ * memory and handing it straight back.
+ *
+ * See DECODER_RESERVE_MP3 above for why two thresholds could not answer this.
+ * The short version: libhelix spins forever rather than returning an error, so
+ * the only safe way to find out is to find out somewhere else first.
+ *
+ * And the library's own entry points will say. MP3InitDecoder() and
+ * AACInitDecoder() make exactly the allocations CommonHelix::begin() is about
+ * to make, in the same order and the same sizes, and both return null rather
+ * than spinning when one of them cannot be had. The two buffers begin() then
+ * resizes are public constants. So: take the decoder, take the buffers, free
+ * all of it, and report. Fragmentation is included for free, because this is
+ * not a model of the allocation -- it is the allocation.
+ *
+ * Fidelity of the answer: the probe frees in reverse order, so the same holes
+ * are there for the real call a few microseconds later. This task is pinned to
+ * core 1 above loop(), so nothing on that core can take them in between; only
+ * the core-0 tasks (Wi-Fi, lwIP, the heap guard) can, and a stream that loses
+ * that race now gets a refusal and a retry instead of a board that has to be
+ * unplugged.
+ *
+ * Cost: a few hundred microseconds, once per stream.
+ */
+bool decoderMemoryFits(bool aac, uint32_t *costOut) {
+  void *frame = nullptr;
+  void *pcm = nullptr;
+  bool ok = false;
+  const uint32_t before = usableFree();
+  uint32_t cost = 0;
+
+  if (aac) {
+    HAACDecoder h = AACInitDecoder();
+    if (h) {
+      frame = malloc(AAC_MAX_FRAME_SIZE);
+      pcm = malloc(AAC_MAX_OUTPUT_SIZE);
+      ok = frame && pcm;
+      // While everything is still held, so this is what the decoder will
+      // actually take rather than what the constants guess it takes.
+      const uint32_t during = usableFree();
+      cost = before > during ? before - during : 0;
+      free(pcm);
+      free(frame);
+      AACFreeDecoder(h);
+    }
+  } else {
+    HMP3Decoder h = MP3InitDecoder();
+    if (h) {
+      frame = malloc(MP3_MAX_FRAME_SIZE);
+      pcm = malloc(MP3_MAX_OUTPUT_SIZE);
+      ok = frame && pcm;
+      const uint32_t during = usableFree();
+      cost = before > during ? before - during : 0;
+      free(pcm);
+      free(frame);
+      MP3FreeDecoder(h);
+    }
+  }
+  if (costOut) *costOut = cost;
+  return ok;
 }
 
 void arenaRelease() {
@@ -839,22 +997,27 @@ void runStream(const char *url, bool *stopped) {
   const uint32_t block = ESP.getMaxAllocHeap();     // internal only
 
   /*
-   * The small ring, on a board whose arena is internal, whenever the heap at
-   * this moment says the full one would leave too little to run on -- see
-   * STREAM_TIGHT_BELOW for the measurement behind the line. The saving is the
-   * difference between the two rings, and it comes off `needed` because the
-   * floor was built from the full ring; so this also rescues a start that the
-   * full ring alone would have had refused. Never on a WROVER, whose ring is
-   * in external RAM and costs the internal heap nothing.
+   * Admit the stream on the small ring, on a board whose arena is internal,
+   * whenever the heap at this moment says the full one would leave too little
+   * to run on -- see STREAM_TIGHT_BELOW for the measurement behind the line.
+   * The saving is the difference between the two rings, and it comes off
+   * `needed` because the floor was built from the full ring; so this also
+   * rescues a start that the full ring alone would have had refused. Never on
+   * a WROVER, whose ring is in external RAM and costs the internal heap
+   * nothing.
+   *
+   * What this no longer does is CHOOSE the ring. That happens after the
+   * handshake, out of what the handshake actually left, and it can land lower
+   * than RING_BYTES_TIGHT -- so this is the ring the admission arithmetic
+   * assumes, and it is deliberately the pessimistic one of the two.
    */
   const uint32_t tightSaving =
       arenaElsewhere ? 0u : (uint32_t)(RING_BYTES_MIN - RING_BYTES_TIGHT);
   const bool tight = !arenaElsewhere && heap < STREAM_TIGHT_BELOW;
   const uint32_t neededNow = tight ? needed - tightSaving : needed;
   if (tight) {
-    LOGF("[radio] %u B free: using the %u kB ring so the dashboard keeps room "
-         "to answer while this plays\n", (unsigned)heap,
-         (unsigned)(RING_BYTES_TIGHT / 1024));
+    LOGF("[radio] %u B free: admitting this on the small ring so the dashboard "
+         "keeps room to answer while it plays\n", (unsigned)heap);
   }
   // The block floor exists for the arena, so it only applies while the arena is
   // coming out of the internal heap. A TLS context wants large pieces too, and
@@ -862,7 +1025,7 @@ void runStream(const char *url, bool *stopped) {
   // arena is a smaller block, and the floor follows it.
   const uint32_t blockFloor =
       arenaElsewhere ? 12000u
-                     : (tight ? (uint32_t)(RING_BYTES_TIGHT + READ_CHUNK + DECODE_CHUNK + 1024)
+                     : (tight ? (uint32_t)(RING_BYTES_FLOOR + READ_CHUNK + DECODE_CHUNK + 1024)
                               : STREAM_BLOCK_FLOOR);
   if (heap < neededNow || block < blockFloor) {
     char why[RADIO_TEXT_MAX];
@@ -1032,7 +1195,45 @@ void runStream(const char *url, bool *stopped) {
    * memory. The socket has not been read from yet, so nothing is lost by
    * waiting.
    */
-  if (!arenaAcquire(tight)) {
+  /*
+   * How big the ring may be, decided from what the handshake actually left
+   * rather than from a constant chosen before it.
+   *
+   * The old arrangement picked between two fixed rings from the heap figure at
+   * Play, a good deal of allocation earlier, and it could not see the one thing
+   * that matters on a WROOM: the decoder still has to fit AFTER this. With the
+   * dashboard and the UPnP renderer up, the 12 kB "tight" ring left 40,800
+   * bytes and libhelix wanted more -- and losing that argument is a board that
+   * has to be unplugged, not a stream that does not play.
+   *
+   * So the ring takes what is left over instead of taking a share: reserve what
+   * the decoder will want (DECODER_RESERVE_*, by codec, because AAC's state and
+   * its 8 kB PCM buffer are half as much again) plus what has to survive it
+   * (STREAM_WORKING_RESERVE), and the ring is whatever remains -- bounded by
+   * the ring this firmware has always used at the top and by RING_BYTES_FLOOR
+   * at the bottom. Below the floor it does not shrink further: it starts anyway
+   * and lets decoderMemoryFits() give the honest answer a few lines down.
+   *
+   * A WROVER skips all of it. Its ring is in external RAM and costs the
+   * internal heap nothing, so it asks for RING_BYTES_MIN as the floor exactly
+   * as before and board_buffer_budget() hands it the PSRAM-sized one.
+   */
+  size_t ringWant = RING_BYTES_MIN;
+  if (!arenaElsewhere) {
+    const uint32_t reserve =
+        (aac ? DECODER_RESERVE_AAC : DECODER_RESERVE_MP3) + STREAM_WORKING_RESERVE;
+    const uint32_t fixed = (uint32_t)(READ_CHUNK + DECODE_CHUNK);
+    const uint32_t freeNow = usableFree();
+    const uint32_t spare = freeNow > reserve + fixed ? freeNow - reserve - fixed : 0;
+    ringWant = spare > RING_BYTES_MIN ? RING_BYTES_MIN : (size_t)spare;
+    if (ringWant < RING_BYTES_FLOOR) ringWant = RING_BYTES_FLOOR;
+    LOGF("[radio] ring %u kB: %u B usable, keeping %u back for the %s decoder "
+         "and what has to run beside it\n",
+         (unsigned)(ringWant / 1024), (unsigned)freeNow, (unsigned)reserve,
+         aac ? "AAC" : "MP3");
+  }
+
+  if (!arenaAcquire(ringWant)) {
     stream->end();
     delete stream;
     delete tls;
@@ -1041,27 +1242,65 @@ void runStream(const char *url, bool *stopped) {
   }
 
   /*
-   * The decoder's memory, checked before libhelix is allowed to want it. See
-   * DECODER_HEAP_NEED: the library's allocator spins forever on a failure, on
-   * this task, at a priority that takes loop() down with it. A refusal here
-   * is a sentence in status.error and a retry on the backoff; a refusal there
-   * is a board that needs its EN button pressed.
+   * The decoder's memory, taken and given back before libhelix is allowed to
+   * want it. See decoderMemoryFits(): the library's allocator spins forever
+   * rather than failing, on this task, at a priority that takes loop() down
+   * with it. A refusal here is a sentence in status.error and a retry on the
+   * backoff; a refusal there is a board that needs its EN button pressed.
    */
-  {
-    const uint32_t freeNow = ESP.getFreeHeap();
-    const uint32_t blockNow = ESP.getMaxAllocHeap();
-    if (freeNow < DECODER_HEAP_NEED || blockNow < DECODER_BLOCK_NEED) {
-      arenaRelease();
-      stream->end();
-      delete stream;
-      delete tls;
-      char why[RADIO_TEXT_MAX];
-      snprintf(why, sizeof(why), "Not enough memory for the decoder: %u free, %u block",
-               (unsigned)freeNow, (unsigned)blockNow);
-      setState(RADIO_ERROR, why);
-      return;
+  heap_guard_mark("radio: probing the decoder's memory");
+  const uint32_t freeBeforeCodec = usableFree();
+  uint32_t decoderCost = 0;
+  const bool fits = decoderMemoryFits(aac, &decoderCost);
+
+  /*
+   * Fitting is necessary and it is not sufficient.
+   *
+   * A stream that gets the decoder in by spending the last of the heap plays
+   * for a few seconds and then takes the board down -- not in this file, and
+   * not with a message anybody can use. The soak on 2026-09-13 ended with
+   * "after the codec: 10736 free, 5108 block" followed by an abort() on core 1
+   * inside the network stack, which is the failure mode STREAM_HEAP_FLOOR was
+   * written for and could not see, because it is asked before the connection
+   * rather than after it.
+   *
+   * So the second question is asked here, with the one number that is not a
+   * guess: what the probe actually spent. Everything downstream of this point
+   * -- the dashboard's receive buffers, lwIP's pbufs, the renderer's working
+   * regions -- has to come out of what is left, and STREAM_WORKING_RESERVE is
+   * how much of it there has to be.
+   */
+  const bool roomAfter =
+      freeBeforeCodec >= decoderCost + STREAM_WORKING_RESERVE;
+
+  if (!fits || !roomAfter) {
+    const uint32_t blockNow = usableLargest();
+    arenaRelease();
+    stream->end();
+    delete stream;
+    delete tls;
+    char why[RADIO_TEXT_MAX];
+    if (!fits) {
+      snprintf(why, sizeof(why),
+               "Not enough memory for the %s decoder: %u free, %u block",
+               aac ? "AAC" : "MP3", (unsigned)freeBeforeCodec,
+               (unsigned)blockNow);
+    } else {
+      snprintf(why, sizeof(why),
+               "The %s decoder fits but leaves nothing to run on: %u free, it "
+               "wants %u", aac ? "AAC" : "MP3", (unsigned)freeBeforeCodec,
+               (unsigned)decoderCost);
     }
+    setState(RADIO_ERROR, why);
+    LOGF("[radio] not starting the %s decoder: %u B free, %u B largest block, "
+         "it costs %u B and %u B has to survive it. Nothing was handed to "
+         "libhelix, so the board is still answering.\n",
+         aac ? "AAC" : "MP3", (unsigned)freeBeforeCodec, (unsigned)blockNow,
+         (unsigned)decoderCost, (unsigned)STREAM_WORKING_RESERVE);
+    return;
   }
+
+  heap_guard_mark("radio: building the codec object");
 
   // Built here and destroyed at the end of the stream, so the ~30 kB the codec
   // needs is only held while something is playing. In a mode where the web
@@ -1080,7 +1319,12 @@ void runStream(const char *url, bool *stopped) {
     return;
   }
   output.reset();
+  heap_guard_mark("radio: decoder->begin(), where libhelix allocates");
   decoder->begin();
+  heap_guard_mark("radio: decoder allocated");
+  LOGF("[radio] %s decoder in (%u B); %u B usable heap left, %u B largest\n",
+       aac ? "AAC" : "MP3", (unsigned)decoderCost, (unsigned)usableFree(),
+       (unsigned)usableLargest());
 
   id3 = Id3Skip{};
   ringClear();
@@ -1093,6 +1337,7 @@ void runStream(const char *url, bool *stopped) {
   uint32_t lastByteAt = millis();
   uint32_t lastPercentAt = 0;
 
+  heap_guard_mark("radio: playing");
   while (true) {
     // A new request, or a stop, outranks everything.
     if (request.changed) break;

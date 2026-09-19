@@ -491,7 +491,11 @@ size_t board_buffer_budget(size_t want, size_t floor) {
    * is the path the WROOM's radio has always taken -- but only down to the
    * caller's floor and only out of what is left above the reserve.
    */
-  const size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  // 8BIT as well as INTERNAL, for the reason board_alloc() sets out below: the
+  // IRAM leftovers count as internal and cannot hold a byte, so a budget drawn
+  // from them would promise memory this buffer could not use.
+  const size_t largest =
+      heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 
   /*
    * The floor is granted on its own terms; the reserve governs the growth.
@@ -541,8 +545,26 @@ void *board_alloc(size_t bytes, bool allow_internal) {
    * for internal memory as a fallback and should get internal memory or
    * nothing, because the reason to prefer it is usually that something with a
    * deadline is going to touch it.
+   *
+   * And MALLOC_CAP_8BIT with it, which is not decoration.
+   *
+   * MALLOC_CAP_INTERNAL on its own means "on the chip", and on a classic ESP32
+   * part of what is on the chip is the leftover of the IRAM pool -- the ~5 kB
+   * the diagnostics page reports as the difference between "heap free" and
+   * "internal 8b". That memory is reachable only by aligned 32-bit
+   * instructions. A char write into it does not fail: it raises
+   * LoadStoreError, which is an unhandled panic and a reboot.
+   *
+   * It had never been hit because every caller here asked for something large
+   * -- a 22 kB arena, a 10 kB renderer block -- and nothing that size fits in
+   * the IRAM leftovers, so the allocator always came back with DRAM. Splitting
+   * the renderer's block into six pieces, the smallest 600 bytes, found it
+   * immediately: "Guru Meditation Error: Core 1 panic'ed (LoadStoreError) ...
+   * EXCVADDR: 0x4009eb2c" (COM3, 2026-09-13), an IRAM address, in a buffer
+   * this function had just handed out. Every caller of board_alloc() stores
+   * bytes in what it gets back, so the capability is right for all of them.
    */
-  return heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL);
+  return heap_caps_malloc(bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
 }
 
 void board_free(void *ptr) {

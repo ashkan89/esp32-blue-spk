@@ -109,6 +109,11 @@ struct Settings {
   uint8_t sleepMode;
   uint16_t sleepAfterS;
 
+  // The on-board indicator: a StatusLedMode, and how long after an event a
+  // timed indicator stays lit. Power saving overrides both; see status_led.h.
+  uint8_t statusLedMode;
+  uint16_t statusLedAfterS;
+
   LedConfig leds;
 
   // The five-band tone stack and its preset. Lives here rather than in
@@ -366,6 +371,20 @@ void loadSettings(const char *fallbackName) {
       (int)POWER_SLEEP_AFTER_S_MAX);
   power_configure_sleep((SleepMode)settings.sleepMode, settings.sleepAfterS);
 
+  // The indicator. Only two variables the tick reads, so this is safe whether or
+  // not status_led_begin() has run yet. On by default: a board with no other
+  // indicator should not boot dark because nobody has visited Settings.
+  settings.statusLedMode = prefs.getUChar("indMode", (uint8_t)STATUS_LED_MODE_ON);
+  settings.statusLedAfterS = prefs.getUShort("indS", STATUS_LED_AFTER_S_DEFAULT);
+  if (settings.statusLedMode >= (uint8_t)STATUS_LED_MODE_COUNT) {
+    settings.statusLedMode = (uint8_t)STATUS_LED_MODE_ON;
+  }
+  settings.statusLedAfterS = (uint16_t)constrain(
+      (int)settings.statusLedAfterS, (int)STATUS_LED_AFTER_S_MIN,
+      (int)STATUS_LED_AFTER_S_MAX);
+  status_led_configure((StatusLedMode)settings.statusLedMode,
+                       settings.statusLedAfterS);
+
   /*
    * The ring. Loaded in every radio mode, not just the ones with a dashboard:
    * a Bluetooth-only speaker still has lights on it, and they should come back
@@ -471,6 +490,8 @@ void saveSettings() {
   prefs.putUChar("pwrPct", settings.powerThreshold);
   prefs.putUChar("slpMode", settings.sleepMode);
   prefs.putUShort("slpS", settings.sleepAfterS);
+  prefs.putUChar("indMode", settings.statusLedMode);
+  prefs.putUShort("indS", settings.statusLedAfterS);
 
   saveLedSettings();
 }
@@ -2304,6 +2325,17 @@ void handleSettingsGet() {
   pwr["sleepPossible"] = power_sleep_possible();
   pwr["idleSeconds"] = power_idle_ms() / 1000;
   pwr["wokeFromSleep"] = power_woke_from_sleep();
+  // The indicator lives on the same card because saving is what overrides it,
+  // and the two facts belong next to each other.
+  pwr["indicator"] = settings.statusLedMode;
+  pwr["indicatorAfterSeconds"] = settings.statusLedAfterS;
+  pwr["indicatorMinSeconds"] = STATUS_LED_AFTER_S_MIN;
+  pwr["indicatorMaxSeconds"] = STATUS_LED_AFTER_S_MAX;
+  pwr["indicatorWired"] = status_led_present();
+  // Which layer has it dark right now, so the card can say so rather than
+  // leaving the owner to wonder whether the setting took.
+  pwr["indicatorMuted"] = status_led_muted();
+  pwr["indicatorResting"] = status_led_resting();
 
   JsonObject df = doc["dfplayer"].to<JsonObject>();
   df["source"] = settings.dfSource;
@@ -2488,6 +2520,25 @@ void handleSettingsSave() {
   }
   if (sleepChanged) {
     power_configure_sleep((SleepMode)settings.sleepMode, settings.sleepAfterS);
+  }
+
+  // The indicator, applied at once like the rest of the card. Saving still
+  // wins: status_led_configure() only sets the mode, and the mute sits above it.
+  bool indicatorChanged = false;
+  if (!body["indicatorMode"].isNull()) {
+    settings.statusLedMode = (uint8_t)constrain(
+        body["indicatorMode"].as<int>(), 0, (int)STATUS_LED_MODE_COUNT - 1);
+    indicatorChanged = true;
+  }
+  if (!body["indicatorAfterSeconds"].isNull()) {
+    settings.statusLedAfterS = (uint16_t)constrain(
+        body["indicatorAfterSeconds"].as<int>(), (int)STATUS_LED_AFTER_S_MIN,
+        (int)STATUS_LED_AFTER_S_MAX);
+    indicatorChanged = true;
+  }
+  if (indicatorChanged) {
+    status_led_configure((StatusLedMode)settings.statusLedMode,
+                         settings.statusLedAfterS);
   }
 
   // The battery pack. Applied immediately rather than at the next boot: these
@@ -2829,6 +2880,8 @@ void handleSettingsBackup() {
   pwr["threshold"] = settings.powerThreshold;
   pwr["sleepMode"] = settings.sleepMode;
   pwr["sleepAfterSeconds"] = settings.sleepAfterS;
+  pwr["indicator"] = settings.statusLedMode;
+  pwr["indicatorAfterSeconds"] = settings.statusLedAfterS;
 
   JsonObject led = s["leds"].to<JsonObject>();
   led["enabled"] = settings.leds.enabled;
@@ -3226,6 +3279,15 @@ void handleSettingsRestore() {
       settings.sleepAfterS = (uint16_t)constrain(
           pwr["sleepAfterSeconds"].as<int>(), (int)POWER_SLEEP_AFTER_S_MIN,
           (int)POWER_SLEEP_AFTER_S_MAX);
+    }
+    if (!pwr["indicator"].isNull()) {
+      settings.statusLedMode = (uint8_t)constrain(
+          pwr["indicator"].as<int>(), 0, (int)STATUS_LED_MODE_COUNT - 1);
+    }
+    if (!pwr["indicatorAfterSeconds"].isNull()) {
+      settings.statusLedAfterS = (uint16_t)constrain(
+          pwr["indicatorAfterSeconds"].as<int>(), (int)STATUS_LED_AFTER_S_MIN,
+          (int)STATUS_LED_AFTER_S_MAX);
     }
   }
 
@@ -4859,6 +4921,17 @@ const char *management_device_name(const char *fallback) {
 
 RadioMode management_radio_mode() { return radioMode; }
 
+RadioMode management_stored_radio_mode() {
+  // loadSettings() is what opens `prefs`, and main.cpp has already been through
+  // management_device_name() by the time this is asked -- but say so rather
+  // than depend on it, because a getUChar() on a closed Preferences returns the
+  // default and that default is a mode.
+  if (!stableDeviceName.length()) loadSettings(APP_NAME);
+  RadioMode mode = (RadioMode)prefs.getUChar("radioMode", RADIO_MODE_MANAGEMENT);
+  if (mode >= RADIO_MODE_COUNT) mode = RADIO_MODE_MANAGEMENT;
+  return mode;
+}
+
 RadioMode management_next_mode() {
   return (RadioMode)((radioMode + 1) % RADIO_MODE_COUNT);
 }
@@ -5215,7 +5288,14 @@ void management_loop() {
 
   if (!radio_mode_has_wifi(radioMode)) return;
 
+  // Marked so a stall in loop() can be told apart from one in the renderer.
+  // NetworkClient::write() retries a peer that is not reading ten times with a
+  // one-second select() each, so one browser tab that has gone to sleep can
+  // hold this call for the best part of ten seconds, and the heap guard's
+  // "loop() has not run" line is otherwise the only evidence.
+  heap_guard_mark("web: serving a dashboard request");
   server.handleClient();
+  heap_guard_mark("web: dashboard idle");
   // After the web server, so a request is never held up behind a broker that
   // has stopped answering. ha_loop() returns immediately when MQTT is off or
   // the station is down, which is most passes.

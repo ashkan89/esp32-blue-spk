@@ -151,6 +151,8 @@ NVS_HOME = {
     "pwrPct": ("pwr", "threshold"),
     "slpMode": ("pwr", "sleepMode"),
     "slpS": ("pwr", "sleepAfterSeconds"),
+    "indMode": ("pwr", "indicator"),
+    "indS": ("pwr", "indicatorAfterSeconds"),
 
     "ledOn": ("led", "enabled"),
     "ledFx": ("led", "effect"),

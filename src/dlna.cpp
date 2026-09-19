@@ -99,7 +99,31 @@ const uint32_t SSDP_MX_CAP_MS = 800;
  * that meant it will try again.
  */
 const uint32_t REQUEST_TIMEOUT_MS = 600;
+
+/*
+ * How much of a request body is kept.
+ *
+ * Four kilobytes where there is external RAM to hold it, because a DIDL-Lite
+ * metadata blob from a NAS routinely runs to two or three and there is no
+ * reason to lose any of it.
+ *
+ * Two on a board without it. Only two things are ever read out of this buffer
+ * -- CurrentURI and the <dc:title> inside CurrentURIMetaData -- and SOAP sends
+ * arguments in the order the service description declares them, which puts
+ * CurrentURI first. So the address always survives; what a truncated body can
+ * cost is the track title, which is a line on a display. Two kilobytes of
+ * internal heap on a WROOM is a decoder allocation, and that is not a line on a
+ * display.
+ *
+ * readRequest() truncates rather than refusing, and drains the rest of the body
+ * off the socket so the connection stays usable -- see the note there. Refusing
+ * would turn "the title is missing" into "nothing plays".
+ */
+#if BOARD_EXPECTS_PSRAM
 const size_t REQUEST_BODY_MAX = 4096;
+#else
+const size_t REQUEST_BODY_MAX = 2048;
+#endif
 const size_t REQUEST_LINE_MAX = 512;
 
 /// GENA subscription lifetime, in seconds, and what we grant regardless of what
@@ -131,16 +155,7 @@ uint32_t nextAlive;
 uint32_t nextStartAttempt;
 
 /*
- * The SOAP request body, in external RAM where there is any.
- *
- * Four kilobytes, because a DIDL-Lite metadata blob from a NAS routinely runs
- * to two or three. As a file-scope array it would be four kilobytes of internal
- * DRAM held from boot on a speaker that may never see a controller -- which is
- * the same argument net_radio.cpp makes about its jitter buffer, and it lands
- * the same way. Allocated when the renderer starts, released when it stops.
- */
-/*
- * Every working buffer this module needs, in one block in external RAM.
+ * Every working buffer this module needs, on the heap.
  *
  * These were locals. That was wrong, and it was wrong in a way that took a
  * board down: everything here runs on the Arduino loop task, whose stack is
@@ -151,8 +166,13 @@ uint32_t nextStartAttempt;
  * anything, but at whatever happened to be deepest when the margin ran out,
  * which is why the backtrace pointed at the update check instead.
  *
- * One PSRAM block instead, carved into named regions. This is also the answer
- * to "why fit 8 MB of external RAM and then put kilobytes on an 8 kB stack".
+ * Named heap regions instead. This is also the answer to "why fit 8 MB of
+ * external RAM and then put kilobytes on an 8 kB stack".
+ *
+ * Two things about them are decided further down rather than here, and both
+ * are about the WROOM: HOW MANY allocations they are (see SCRATCH_REGIONS) and
+ * WHEN they are held (see scratchPersistent). On a WROVER neither question has
+ * ever been interesting -- they live in external RAM for the renderer's life.
  *
  * ALIASING RULES, because these are shared and the compiler will not check:
  *
@@ -175,15 +195,133 @@ uint32_t nextStartAttempt;
  * Nothing here is re-entrant, and nothing needs to be: dlna_loop() is the only
  * caller and it runs on one task.
  */
+/*
+ * SIX allocations rather than one, and the reason is measured.
+ *
+ * As a single struct this was 7,796 bytes on a WROOM, and the heap it has to
+ * come out of while something is playing does not have 7,796 contiguous bytes
+ * to give. The soak on 2026-09-13 is unambiguous: "no room for the 7796-byte
+ * working block (21220 free, 5620 largest)". Twenty-one kilobytes free and the
+ * renderer could not be served, because a decoder that has just taken 33 kB in
+ * ten pieces leaves the tail of the heap in pieces too.
+ *
+ * Nothing here needs to be contiguous with anything else -- the regions are
+ * separate buffers that happened to be written as one struct -- so the fix is
+ * to stop asking for them to be. The largest single piece is now the request
+ * body, and every one of them fits in the fragments that are actually there.
+ */
+const size_t SCR_BODY = REQUEST_BODY_MAX;
+const size_t SCR_OUT = 2048;
+const size_t SCR_ARGS = 1200;
+const size_t SCR_XML = 1200;
+const size_t SCR_SSDP = 700;
+const size_t SCR_URI = DLNA_URI_MAX * 2;
+
 struct Scratch {
-  char body[REQUEST_BODY_MAX];
-  char out[2048];
-  char args[1200];
-  char xml[1200];
-  char ssdp[700];
-  char uri[DLNA_URI_MAX * 2];
+  char *body;
+  char *out;
+  char *args;
+  char *xml;
+  char *ssdp;
+  char *uri;
 };
-Scratch *scr;
+Scratch scr;
+bool scrHeld;
+
+/*
+ * WHEN the block is held, which is a different question on the two boards.
+ *
+ * On a WROVER it is held for the life of the renderer, as it always has been:
+ * it lives in external RAM, nothing else wants that RAM, and an allocation
+ * that can never fail is one less thing to reason about.
+ *
+ * On a WROOM they are taken when there is something to do and given back at
+ * the end of the pass, and that is not tidiness -- it is the difference
+ * between a speaker that plays what a controller hands it and one that has to
+ * be unplugged. Held from the moment the renderer starts, they are missing at
+ * the one moment they are needed most: libhelix allocates ~33 kB in about ten
+ * pieces when a stream starts, and on a WROOM with the dashboard up that is
+ * the whole of the margin. Measured on COM3, 2026-09-13: 37,080 bytes free at
+ * the decoder with them resident, 46,924 without. The renderer takes them back
+ * afterwards out of what the stream left, which is what STREAM_WORKING_RESERVE
+ * in net_radio.cpp exists to keep there.
+ *
+ * The renderer is idle almost all of the time -- a controller polls it about
+ * once a second -- so the churn is a handful of malloc/free pairs a second and
+ * nothing at all when the room is empty. If the memory cannot be had, the pass
+ * does nothing and tries again on the next one: a missed SSDP answer is a
+ * repeated discovery, and a missed request is a controller retry. Neither is a
+ * board that stops answering.
+ */
+bool scratchPersistent;
+uint32_t scratchDenied;  ///< passes that had work and no memory, for `diag`
+
+/// The regions and their sizes, in one place, so acquire and release cannot
+/// drift apart and neither can forget one.
+struct ScratchRegion {
+  char **slot;
+  size_t size;
+};
+const ScratchRegion SCRATCH_REGIONS[] = {
+    {&scr.body, SCR_BODY}, {&scr.out, SCR_OUT},   {&scr.args, SCR_ARGS},
+    {&scr.xml, SCR_XML},   {&scr.ssdp, SCR_SSDP}, {&scr.uri, SCR_URI},
+};
+
+void scratchFree() {
+  for (const auto &r : SCRATCH_REGIONS) {
+    board_free(*r.slot);
+    *r.slot = nullptr;
+  }
+  scrHeld = false;
+}
+
+bool scratchAcquire() {
+  if (scrHeld) return true;
+  for (const auto &r : SCRATCH_REGIONS) {
+    *r.slot = (char *)board_alloc(r.size, /*allow_internal=*/true);
+    if (!*r.slot) {
+      // Read before the unwind: after scratchFree() the numbers describe a heap
+      // that has just had everything handed back to it, which is not the heap
+      // that refused.
+      const unsigned freeThen = (unsigned)heap_caps_get_free_size(
+          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      const unsigned largestThen = (unsigned)heap_caps_get_largest_free_block(
+          MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      // All or nothing. A half-acquired set would be a null dereference the
+      // first time a handler reached the region that did not arrive.
+      scratchFree();
+      // Logged once. A renderer that cannot get its memory is worth knowing
+      // about -- it means something playing has taken the room
+      // STREAM_WORKING_RESERVE was supposed to keep -- but a line per pass
+      // would bury the reason.
+      if (!scratchDenied) {
+        LOGF("[dlna] no room for a %u-byte working region (%u usable, %u "
+             "largest). Answering nothing this pass; the controller will "
+             "retry.\n", (unsigned)r.size, freeThen, largestThen);
+      }
+      scratchDenied++;
+      return false;
+    }
+  }
+  scrHeld = true;
+  return true;
+}
+
+/// Gives the regions back, unless this board holds them for the renderer's
+/// life. Called once at the end of dlna_loop(), so a request that spans
+/// several functions sees one consistent set of buffers throughout.
+void scratchRelease() {
+  if (scratchPersistent || !scrHeld) return;
+  scratchFree();
+}
+
+/// Every region, for the log line and the console. Not sizeof(Scratch) any
+/// more -- that is six pointers.
+size_t scratchBytes() {
+  size_t total = 0;
+  for (const auto &r : SCRATCH_REGIONS) total += r.size;
+  return total;
+}
 
 /*
  * M-SEARCH answers that are not due yet.
@@ -617,6 +755,7 @@ uint8_t subscriptionCount() {
  * state with GetTransportInfo anyway.
  */
 void sendNotify(Subscription &s) {
+  if (!scratchAcquire()) return;
   s.notifyPending = false;
 
   // Parse "http://host:port/path" out of the callback.
@@ -639,8 +778,8 @@ void sendNotify(Subscription &s) {
   host[hostLen] = '\0';
   const char *path = slash ? slash : "/";
 
-  char *inner = scr->xml;
-  char *escaped = scr->args;
+  char *inner = scr.xml;
+  char *escaped = scr.args;
   if (s.avTransport) {
     /*
      * The URI is escaped twice on the way out, and that is correct rather than
@@ -649,9 +788,9 @@ void sendNotify(Subscription &s) {
      * of an element. Getting this wrong is why a controller shows an empty
      * "now playing" next to audio it can hear.
      */
-    char *uri = scr->uri;
-    xmlEscape(uri, sizeof(scr->uri), currentUri);
-    snprintf(inner, sizeof(scr->xml),
+    char *uri = scr.uri;
+    xmlEscape(uri, SCR_URI, currentUri);
+    snprintf(inner, SCR_XML,
              "<Event xmlns=\"urn:schemas-upnp-org:metadata-1-0/AVT/\">"
              "<InstanceID val=\"0\">"
              "<TransportState val=\"%s\"/>"
@@ -665,7 +804,7 @@ void sendNotify(Subscription &s) {
              transportName(currentTransport()), uri, uri,
              currentUri[0] ? 1 : 0, currentUri[0] ? 1 : 0);
   } else {
-    snprintf(inner, sizeof(scr->xml),
+    snprintf(inner, SCR_XML,
              "<Event xmlns=\"urn:schemas-upnp-org:metadata-1-0/RCS/\">"
              "<InstanceID val=\"0\">"
              "<Volume channel=\"Master\" val=\"%u\"/>"
@@ -673,11 +812,11 @@ void sendNotify(Subscription &s) {
              "</InstanceID></Event>",
              (unsigned)toUpnpVolume(net_radio_volume()), muted ? 1 : 0);
   }
-  xmlEscape(escaped, sizeof(scr->args), inner);
+  xmlEscape(escaped, SCR_ARGS, inner);
 
-  char *body = scr->out;
+  char *body = scr.out;
   const int bodyLen = snprintf(
-      body, sizeof(scr->out),
+      body, SCR_OUT,
       "<?xml version=\"1.0\"?>"
       "<e:propertyset xmlns:e=\"urn:schemas-upnp-org:event-1-0\">"
       "<e:property><LastChange>%s</LastChange></e:property>"
@@ -743,8 +882,8 @@ void sendResponse(NetworkClient &client, int code, const char *contentType,
 /// number: 402 invalid args, 701 transition not available, 714 unsupported
 /// media, 501 action failed.
 void sendSoapFault(NetworkClient &client, int code, const char *reason) {
-  char *body = scr->out;
-  snprintf(body, sizeof(scr->out),
+  char *body = scr.out;
+  snprintf(body, SCR_OUT,
            "<?xml version=\"1.0\"?>"
            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
@@ -759,8 +898,8 @@ void sendSoapFault(NetworkClient &client, int code, const char *reason) {
 
 void sendSoapOk(NetworkClient &client, const char *service, const char *action,
                 const char *args) {
-  char *body = scr->out;
-  snprintf(body, sizeof(scr->out),
+  char *body = scr.out;
+  snprintf(body, SCR_OUT,
            "<?xml version=\"1.0\"?>"
            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
@@ -773,11 +912,11 @@ void sendSoapOk(NetworkClient &client, const char *service, const char *action,
 // ================================================================== XML ======
 
 void serveDeviceDescription(NetworkClient &client) {
-  char *name = scr->args;
-  xmlEscape(name, sizeof(scr->args), friendlyName);
-  char *body = scr->out;
+  char *name = scr.args;
+  xmlEscape(name, SCR_ARGS, friendlyName);
+  char *body = scr.out;
   snprintf(
-      body, sizeof(scr->out),
+      body, SCR_OUT,
       "<?xml version=\"1.0\"?>"
       "<root xmlns=\"urn:schemas-upnp-org:device-1-0\" "
       "xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">"
@@ -1023,9 +1162,9 @@ void handleAvTransport(NetworkClient &client, const char *action,
 
     // The title, if the controller sent DIDL-Lite metadata. Not invented when
     // it did not: the dashboard would rather show the host than a guess.
-    char *meta = scr->xml;
+    char *meta = scr.xml;
     currentTitle[0] = '\0';
-    if (xmlValue(body, "CurrentURIMetaData", meta, sizeof(scr->xml)) && meta[0]) {
+    if (xmlValue(body, "CurrentURIMetaData", meta, SCR_XML) && meta[0]) {
       xmlUnescape(meta);
       char title[DLNA_TITLE_MAX];
       if (xmlValue(meta, "title", title, sizeof(title)))
@@ -1075,8 +1214,8 @@ void handleAvTransport(NetworkClient &client, const char *action,
   }
 
   if (strcmp(action, "GetTransportInfo") == 0) {
-    char *args = scr->args;
-    snprintf(args, sizeof(scr->args),
+    char *args = scr.args;
+    snprintf(args, SCR_ARGS,
              "<CurrentTransportState>%s</CurrentTransportState>"
              "<CurrentTransportStatus>OK</CurrentTransportStatus>"
              "<CurrentSpeed>1</CurrentSpeed>",
@@ -1103,10 +1242,10 @@ void handleAvTransport(NetworkClient &client, const char *action,
       elapsed = (millis() - r.playingSince) / 1000;
     char rel[16];
     formatDuration(rel, sizeof(rel), elapsed);
-    char *uri = scr->uri;
-    xmlEscape(uri, sizeof(scr->uri), currentUri);
-    char *args = scr->args;
-    snprintf(args, sizeof(scr->args),
+    char *uri = scr.uri;
+    xmlEscape(uri, SCR_URI, currentUri);
+    char *args = scr.args;
+    snprintf(args, SCR_ARGS,
              "<Track>%d</Track><TrackDuration>0:00:00</TrackDuration>"
              "<TrackMetaData></TrackMetaData><TrackURI>%s</TrackURI>"
              "<RelTime>%s</RelTime><AbsTime>NOT_IMPLEMENTED</AbsTime>"
@@ -1117,10 +1256,10 @@ void handleAvTransport(NetworkClient &client, const char *action,
   }
 
   if (strcmp(action, "GetMediaInfo") == 0) {
-    char *uri = scr->uri;
-    xmlEscape(uri, sizeof(scr->uri), currentUri);
-    char *args = scr->args;
-    snprintf(args, sizeof(scr->args),
+    char *uri = scr.uri;
+    xmlEscape(uri, SCR_URI, currentUri);
+    char *args = scr.args;
+    snprintf(args, SCR_ARGS,
              "<NrTracks>%d</NrTracks><MediaDuration>0:00:00</MediaDuration>"
              "<CurrentURI>%s</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>"
              "<NextURI></NextURI><NextURIMetaData></NextURIMetaData>"
@@ -1208,8 +1347,8 @@ void handleRenderingControl(NetworkClient &client, const char *action,
 
 void handleConnectionManager(NetworkClient &client, const char *action) {
   if (strcmp(action, "GetProtocolInfo") == 0) {
-    char *args = scr->args;
-    snprintf(args, sizeof(scr->args), "<Source></Source><Sink>%s</Sink>",
+    char *args = scr.args;
+    snprintf(args, SCR_ARGS, "<Source></Source><Sink>%s</Sink>",
              (const char *)FPSTR(SINK_PROTOCOL_INFO));
     sendSoapOk(client, "ConnectionManager", "GetProtocolInfo", args);
     return;
@@ -1371,14 +1510,41 @@ bool readRequest(NetworkClient &client, Request &req, char *body,
   }
 
   if (req.contentLength) {
-    if (req.contentLength >= bodySize) return false;  // refuse, do not truncate
+    /*
+     * Keep what fits, drain the rest.
+     *
+     * This used to refuse a body larger than the buffer, and on a board where
+     * the buffer is 2 kB that would have turned a NAS's three-kilobyte
+     * DIDL-Lite blob into "this controller cannot play anything here". What is
+     * actually wanted out of the body -- see REQUEST_BODY_MAX -- is in the
+     * first argument either way.
+     *
+     * The overflow still has to come off the socket: this is HTTP/1.1 with the
+     * connection kept open, so bytes left unread are the front of the next
+     * request. They are read into `line`, which is finished with by now, and
+     * thrown away.
+     */
+    const size_t keep = req.contentLength < bodySize ? req.contentLength
+                                                     : bodySize - 1;
     size_t got = 0;
-    while (got < req.contentLength && millis() < deadline) {
-      const int n = client.read((uint8_t *)body + got, req.contentLength - got);
+    while (got < keep && millis() < deadline) {
+      const int n = client.read((uint8_t *)body + got, keep - got);
       if (n > 0) got += (size_t)n;
       else delay(1);
     }
     body[got] = '\0';
+
+    size_t drop = req.contentLength - got;
+    if (drop) {
+      LOGF("[dlna] body truncated: kept %u of %u bytes\n", (unsigned)got,
+           (unsigned)req.contentLength);
+    }
+    while (drop && millis() < deadline) {
+      const size_t want = drop < sizeof(line) ? drop : sizeof(line);
+      const int n = client.read((uint8_t *)line, want);
+      if (n > 0) drop -= (size_t)n;
+      else delay(1);
+    }
   }
   return true;
 }
@@ -1402,6 +1568,9 @@ const char *soapActionName(const char *header) {
  */
 void serveRequest(NetworkClient &client) {
   heap_guard_mark("dlna: serving a control request");
+  // No working block, no answer. The connection is left open and the
+  // controller's retry lands on a later pass; see scratchAcquire().
+  if (!scratchAcquire()) return;
   // Milliseconds: this is Stream's per-read timeout, not a socket option (the
   // previous value here was 1, believed to be seconds, so a header split across
   // two segments was cut off after a millisecond). The deadline inside
@@ -1409,7 +1578,7 @@ void serveRequest(NetworkClient &client) {
   client.setTimeout(100);
 
   Request req;
-  char *body = scr->body;
+  char *body = scr.body;
   if (!readRequest(client, req, body, REQUEST_BODY_MAX)) {
     client.stop();
     return;
@@ -1503,12 +1672,13 @@ void ssdpQueue(const char *st, const IPAddress &to, uint16_t toPort,
 }
 
 void ssdpRespond(const char *st, const IPAddress &to, uint16_t toPort) {
+  if (!scratchAcquire()) return;
   char usn[110];
   if (strcmp(st, uuid) == 0) snprintf(usn, sizeof(usn), "%s", uuid);
   else snprintf(usn, sizeof(usn), "%s::%s", uuid, st);
 
-  char *payload = scr->ssdp;
-  snprintf(payload, sizeof(scr->ssdp),
+  char *payload = scr.ssdp;
+  snprintf(payload, SCR_SSDP,
            "HTTP/1.1 200 OK\r\n"
            "CACHE-CONTROL: max-age=%u\r\n"
            "EXT:\r\n"
@@ -1522,10 +1692,11 @@ void ssdpRespond(const char *st, const IPAddress &to, uint16_t toPort) {
 }
 
 void announce(bool alive) {
+  if (!scratchAcquire()) return;
   IPAddress group;
   group.fromString(SSDP_MULTICAST);
   char usn[110];
-  char *payload = scr->ssdp;
+  char *payload = scr.ssdp;
   const char *nts = alive ? "alive" : "byebye";
 
   const char *nts_targets[] = {uuid, "upnp:rootdevice",
@@ -1536,7 +1707,7 @@ void announce(bool alive) {
   for (const char *nt : nts_targets) {
     if (strcmp(nt, uuid) == 0) snprintf(usn, sizeof(usn), "%s", uuid);
     else snprintf(usn, sizeof(usn), "%s::%s", uuid, nt);
-    snprintf(payload, sizeof(scr->ssdp),
+    snprintf(payload, SCR_SSDP,
              "NOTIFY * HTTP/1.1\r\n"
              "HOST: %s:%u\r\n"
              "CACHE-CONTROL: max-age=%u\r\n"
@@ -1558,9 +1729,10 @@ void announce(bool alive) {
 void serviceSsdp() {
   const int size = ssdp.parsePacket();
   if (size <= 0) return;
+  if (!scratchAcquire()) return;
 
-  char *packet = scr->ssdp;
-  const int len = ssdp.read((uint8_t *)packet, sizeof(scr->ssdp) - 1);
+  char *packet = scr.ssdp;
+  const int len = ssdp.read((uint8_t *)packet, SCR_SSDP - 1);
   if (len <= 0) return;
   packet[len] = '\0';
 
@@ -1641,17 +1813,24 @@ bool dlna_begin() {
 
   buildIdentity();
 
-  scr = (Scratch *)board_alloc(sizeof(Scratch), /*allow_internal=*/true);
-  if (!scr) {
+  /*
+   * Hold the working block, or prove it can be had and give it back. See the
+   * note on scratchPersistent: external RAM keeps it, internal RAM lends it.
+   * Either way a renderer that could never allocate it fails here, at the one
+   * point where "no renderer this boot" is still a clean answer.
+   */
+  scratchPersistent = board_can(BOARD_CAP_PSRAM);
+  if (!scratchAcquire()) {
     LOGLN("[dlna] no memory for the renderer's working buffers");
     return false;
   }
+  scratchRelease();
 
   http = new (std::nothrow) NetworkServer(port);
   if (!http) {
     LOGLN("[dlna] no memory for the renderer's HTTP server");
-    board_free(scr);
-    scr = nullptr;
+    scratchPersistent = false;
+    scratchRelease();
     return false;
   }
   http->begin();
@@ -1664,14 +1843,19 @@ bool dlna_begin() {
     http->end();
     delete http;
     http = nullptr;
-    board_free(scr);
-    scr = nullptr;
+    scratchPersistent = false;
+    scratchRelease();
     return false;
   }
+
+  LOGF("[ledger] renderer scratch is %u bytes; heap now %u free, %u block\n",
+       (unsigned)scratchBytes(), (unsigned)ESP.getFreeHeap(),
+       (unsigned)ESP.getMaxAllocHeap());
 
   running = true;
   memset(subs, 0, sizeof(subs));
   announce(true);
+  scratchRelease();
   nextAlive = millis() + SSDP_ALIVE_MS;
   LOGF("[dlna] renderer up: %s on port %u, %s\n", friendlyName, (unsigned)port,
        location);
@@ -1690,8 +1874,8 @@ void dlna_stop() {
     delete http;
     http = nullptr;
   }
-  board_free(scr);
-  scr = nullptr;
+  scratchPersistent = false;  // whatever the policy was, let go of it now
+  scratchRelease();
   running = false;
   LOGLN("[dlna] renderer stopped");
 }
@@ -1747,6 +1931,11 @@ void dlna_loop() {
       break;
     }
   }
+
+  // Everything above shares one working block and none of it is re-entrant, so
+  // this is the one place it is given back -- after the last reader, once per
+  // pass. On a board that holds it for the renderer's life this does nothing.
+  scratchRelease();
 }
 
 bool dlna_running() { return running; }
@@ -1811,6 +2000,12 @@ bool dlna_command(const char *line) {
   if (s.controller[0]) LOGF("[dlna] last controller: %s\n", s.controller);
   LOGF("[dlna] %u subscription(s), %u actions served\n",
        (unsigned)s.subscriptions, (unsigned)s.requests);
+  LOGF("[dlna] working buffers %u bytes in %u pieces, %s%s\n",
+       (unsigned)scratchBytes(),
+       (unsigned)(sizeof(SCRATCH_REGIONS) / sizeof(SCRATCH_REGIONS[0])),
+       scratchPersistent ? "held for the renderer's life (external RAM)"
+                         : "taken per pass (internal RAM)",
+       scratchDenied ? " -- and has been refused at least once" : "");
   LOGLN("[dlna] usage: dlna | dlna on | dlna off");
   return true;
 }
