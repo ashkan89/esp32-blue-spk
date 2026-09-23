@@ -157,6 +157,10 @@ static void build_gamma() {
   }
 }
 
+static uint8_t scaled_channel(uint8_t value, float scale) {
+  return (uint8_t)(gamma_lut[value] * scale + 0.5f);
+}
+
 // ------------------------------------------------------------------- ring ----
 /*
  * Ring geometry. On the 7-bit ring one pixel is in the middle and the rest are
@@ -558,10 +562,12 @@ static void commit(const LedConfig &c, uint32_t now) {
 
   rmt_symbol_word_t *out = symbols;
   for (uint16_t i = 0; i < LED_COUNT; i++) {
-    const uint32_t c8 = dim(buf[i], scale);
-    const uint8_t r = gamma_lut[red_of(c8)];
-    const uint8_t g = gamma_lut[grn_of(c8)];
-    const uint8_t b = gamma_lut[blu_of(c8)];
+    // Shape the effect colour first, then apply user brightness and the current
+    // ceiling linearly. Gamma-correcting the already-dimmed value crushes low
+    // scenes (including the first sunrise steps) all the way to black.
+    const uint8_t r = scaled_channel(red_of(buf[i]), scale);
+    const uint8_t g = scaled_channel(grn_of(buf[i]), scale);
+    const uint8_t b = scaled_channel(blu_of(buf[i]), scale);
 #if LED_STRIP_GRB
     const uint8_t channel[3] = {g, r, b};
 #else

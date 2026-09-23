@@ -49,3 +49,57 @@ jobs:
             test-results/
             build-budgets.json
           retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Validate tag and load signing key
+        shell: pwsh
+        env:
+          SIGNING_KEY_B64: ${{ secrets.FIRMWARE_SIGNING_KEY_B64 }}
+        run: |
+          if ($env:GITHUB_REF_NAME -notmatch '^v(\d+\.\d+\.\d+)$') {
+            throw "Release tags must look like v4.0.1"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY_B64)) {
+            throw "Repository secret FIRMWARE_SIGNING_KEY_B64 is required"
+          }
+          $keyPath = Join-Path $env:RUNNER_TEMP 'firmware-signing-key.pem'
+          [IO.File]::WriteAllBytes(
+            $keyPath,
+            [Convert]::FromBase64String($env:SIGNING_KEY_B64)
+          )
+          "RELEASE_VERSION=$($Matches[1])" >> $env:GITHUB_ENV
+          "SIGNING_KEY_PATH=$keyPath" >> $env:GITHUB_ENV
+      - name: Build and sign WROOM and WROVER firmware
+        shell: pwsh
+        run: >-
+          python scripts/build_release.py
+          --key $env:SIGNING_KEY_PATH
+          --version $env:RELEASE_VERSION
+          --out dist
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $assets = Get-ChildItem -LiteralPath dist -File |
+            ForEach-Object { $_.FullName }
+          if (gh release view $tag *> $null) {
+            gh release upload $tag @assets --clobber
+          } else {
+            gh release create $tag @assets --verify-tag --title $tag --generate-notes
+          }

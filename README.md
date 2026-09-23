@@ -1556,8 +1556,12 @@ update**. Public repositories need no token; a fine-grained token can be saved
 for a private repository. GitHub API and release downloads are verified over TLS
 against the Mozilla root store — see **Trust anchors** below.
 
-Set the version reported by the dashboard in [src/app_config.h](src/app_config.h)
-for each release.
+Pushing a semantic version tag such as `v4.0.1` runs the full verification job,
+builds both release targets with `4.0.1` embedded, signs the board-bound
+`firmware-wroom.spk` and `firmware-wrover.spk` packages, and creates the GitHub
+release. Add the production private key to the repository as the
+`FIRMWARE_SIGNING_KEY_B64` secret (base64 of the PEM file); the workflow fails
+closed if it is absent or does not match `src/signing_public_key.h`.
 
 **Only a newer release is an update.** The tags are compared as numbers,
 component by component: a leading `v` and any pre-release suffix are ignored, and

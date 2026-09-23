@@ -911,6 +911,12 @@ bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error)
     error = "Could not initialize HTTPS";
     return false;
   }
+  // ArduinoJson consumes the body stream directly. GitHub is allowed to use
+  // HTTP/1.1 chunked transfer encoding, but HTTPClient's raw stream still
+  // contains the chunk framing; the first hexadecimal chunk size then looks
+  // like invalid JSON. HTTP/1.0 makes GitHub return an unchunked, close-delimited
+  // body without buffering the roughly 20 KB release document in RAM.
+  http.useHTTP10(true);
   prepareRequest(http, api, job.token);
   http.addHeader("Accept", "application/vnd.github+json");
   http.addHeader("X-GitHub-Api-Version", "2022-11-28");
@@ -937,7 +943,14 @@ bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error)
   const DeserializationError jsonError = deserializeJson(
       release, http.getStream(), DeserializationOption::Filter(filter));
   if (jsonError) {
-    error = "GitHub returned invalid release metadata";
+    error = String("Could not parse GitHub release metadata: ") +
+            jsonError.c_str();
+    return false;
+  }
+
+  if (!release["tag_name"].is<const char *>() ||
+      !release["assets"].is<JsonArray>()) {
+    error = "GitHub release metadata is missing its tag or assets";
     return false;
   }
 
