@@ -367,7 +367,7 @@ bool product_command(JsonVariantConst in, String &error) {
       ui_show_system_status(UI_STATUS_SUCCESS, "OLED check", "0123456789 AaZz", 100, 4000);
     } else if (test == "ring") {
       if (!leds_present()) { error = "LED ring is not configured"; return false; }
-      if (leds_power_saving()) { error = "Turn off power saving before testing the ring"; return false; }
+      // if (leds_power_saving()) { error = "Turn off power saving before testing the ring"; return false; }
       if (!testLightUntil) leds_get(&testLightSaved);
       LedConfig light = testLightSaved; light.enabled = true; light.effect = LED_FX_RAINBOW; light.brightness = 60;
       leds_configure(light); testLightUntil = millis() + 4000;
@@ -474,9 +474,9 @@ void product_support(JsonObject out) {
   product_status(out["health"].to<JsonObject>());
   out["flashOk"] = board_caps().flash_ok; out["psramOk"] = board_caps().psram_ok;
   out["oled"] = ui_present(); out["ring"] = leds_present();
-  out["ringOutputErrors"] = leds_output_errors();
-  out["ringLastFrameMs"] = leds_last_frame_ms();
-  out["ringPowerSaving"] = leds_power_saving();
+  // out["ringOutputErrors"] = leds_output_errors();
+  // out["ringLastFrameMs"] = leds_last_frame_ms();
+  // out["ringPowerSaving"] = leds_power_saving();
   out["clockSource"] = soft_clock_source_name();
   out["clockTrusted"] = soft_clock_trusted();
   out["chipRevision"] = board_caps().chip_revision;

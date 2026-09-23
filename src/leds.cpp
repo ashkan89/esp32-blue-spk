@@ -1,7 +1,5 @@
-#include "product.h"
 #include "app_config.h"
 #include "leds.h"
-#include <atomic>
 
 #if LEDS_ENABLED
 
@@ -63,7 +61,6 @@ static const size_t RMT_MEM_SYMBOLS = 192;
 static rmt_channel_handle_t rmt_channel;
 static rmt_encoder_handle_t rmt_encoder;
 static bool g_present;
-static std::atomic<uint32_t> outputErrors{0}, lastFrameMs{0};
 /// Whether the render task exists. Standby blanking is its job, so a shutdown
 /// that waits for the dark frame has to know there is somebody to draw it.
 static bool task_running;
@@ -158,10 +155,6 @@ static void build_gamma() {
   for (int i = 0; i < 256; i++) {
     gamma_lut[i] = (uint8_t)(powf((float)i / 255.0f, 2.6f) * 255.0f + 0.5f);
   }
-}
-
-static uint8_t scaled_channel(uint8_t value, float scale) {
-  return (uint8_t)(gamma_lut[value] * scale + 0.5f);
 }
 
 // ------------------------------------------------------------------- ring ----
@@ -565,11 +558,10 @@ static void commit(const LedConfig &c, uint32_t now) {
 
   rmt_symbol_word_t *out = symbols;
   for (uint16_t i = 0; i < LED_COUNT; i++) {
-    // Gamma shapes effect colors. Master brightness and the current ceiling
-    // scale the result linearly; applying gamma to them made dim scenes black.
-    const uint8_t r = scaled_channel(red_of(buf[i]), scale);
-    const uint8_t g = scaled_channel(grn_of(buf[i]), scale);
-    const uint8_t b = scaled_channel(blu_of(buf[i]), scale);
+    const uint32_t c8 = dim(buf[i], scale);
+    const uint8_t r = gamma_lut[red_of(c8)];
+    const uint8_t g = gamma_lut[grn_of(c8)];
+    const uint8_t b = gamma_lut[blu_of(c8)];
 #if LED_STRIP_GRB
     const uint8_t channel[3] = {g, r, b};
 #else
@@ -592,11 +584,10 @@ static void commit(const LedConfig &c, uint32_t now) {
   // light is not worth wedging a task over.
   rmt_transmit_config_t tx = {};
   tx.loop_count = 0;
-  esp_err_t result = rmt_transmit(rmt_channel, rmt_encoder, symbols,
-                                SYMBOL_COUNT * sizeof(symbols[0]), &tx);
-  if (result == ESP_OK) result = rmt_tx_wait_all_done(rmt_channel, 50);
-  if (result == ESP_OK) lastFrameMs.store(millis());
-  else outputErrors.fetch_add(1);
+  if (rmt_transmit(rmt_channel, rmt_encoder, symbols,
+                   SYMBOL_COUNT * sizeof(symbols[0]), &tx) == ESP_OK) {
+    rmt_tx_wait_all_done(rmt_channel, 50);
+  }
 }
 
 // -------------------------------------------------------------------- task ---
@@ -654,7 +645,6 @@ static void leds_task(void *) {
     } else {
       render(live, vis, dt, now);
     }
-    if (live.enabled && !powerSave && product_ring(buf, LED_COUNT, &live.brightness)) live.reactivity = 0;
     commit(live, now);
 
     // Same guard as the UI task: an overrun resets the schedule instead of
@@ -738,9 +728,6 @@ void leds_start() {
 }
 
 bool leds_present() { return g_present; }
-uint32_t leds_output_errors() { return outputErrors.load(); }
-uint32_t leds_last_frame_ms() { return lastFrameMs.load(); }
-bool leds_power_saving() { return powerSave; }
 
 void leds_configure(const LedConfig &in) {
   // Any change is a reason to be lit: turning the ring back on from a resting

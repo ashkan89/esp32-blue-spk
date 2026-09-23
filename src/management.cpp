@@ -1653,9 +1653,9 @@ void handleStatus() {
   led["hearingAudio"] = leds_hearing_audio();
   led["resting"] = leds_resting();
   led["idleSeconds"] = leds_idle_ms() / 1000;
-  led["outputErrors"] = leds_output_errors();
-  led["lastFrameMs"] = leds_last_frame_ms();
-  led["powerSaving"] = leds_power_saving();
+  // led["outputErrors"] = leds_output_errors();
+  // led["lastFrameMs"] = leds_last_frame_ms();
+  // led["powerSaving"] = leds_power_saving();
 
   /*
    * The radio, the tone stack and the alarm all appear in the status rather
