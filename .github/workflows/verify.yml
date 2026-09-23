@@ -77,10 +77,19 @@ jobs:
             throw "Repository secret FIRMWARE_SIGNING_KEY_B64 is required"
           }
           $keyPath = Join-Path $env:RUNNER_TEMP 'firmware-signing-key.pem'
-          [IO.File]::WriteAllBytes(
-            $keyPath,
-            [Convert]::FromBase64String($env:SIGNING_KEY_B64)
-          )
+          try {
+            $compact = $env:SIGNING_KEY_B64 -replace '\s', ''
+            $keyBytes = [Convert]::FromBase64String($compact)
+          } catch {
+            # GitHub supports multiline secrets too. Accept raw PEM text under
+            # the existing secret name so setup does not depend on a Base64 tool.
+            $keyBytes = [Text.Encoding]::UTF8.GetBytes($env:SIGNING_KEY_B64)
+          }
+          [IO.File]::WriteAllBytes($keyPath, $keyBytes)
+          python scripts/build_release.py --key $keyPath --validate-key-only
+          if ($LASTEXITCODE -ne 0) {
+            throw "FIRMWARE_SIGNING_KEY_B64 is not the private key matching src/signing_public_key.h"
+          }
           "RELEASE_VERSION=$($Matches[1])" >> $env:GITHUB_ENV
           "SIGNING_KEY_PATH=$keyPath" >> $env:GITHUB_ENV
       - name: Build and sign WROOM and WROVER firmware

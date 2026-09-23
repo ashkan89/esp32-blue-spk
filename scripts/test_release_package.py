@@ -1,7 +1,10 @@
 """Exercise the real package implementation, including hostile inputs."""
+import base64
 import unittest
+from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.exceptions import InvalidSignature
+from build_release import load_signing_key
 from release_package import package, verify
 
 class ReleaseTests(unittest.TestCase):
@@ -33,5 +36,17 @@ class ReleaseTests(unittest.TestCase):
     def test_reject_factory_image(self):
         factory = self.image[:32] + bytes(4) + self.image[36:]
         with self.assertRaises(ValueError): package(factory,'wroom','4.0.0',self.key)
+    def test_signing_key_secret_formats(self):
+        pem=self.key.private_bytes(serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,serialization.NoEncryption())
+        der=self.key.private_bytes(serialization.Encoding.DER,
+            serialization.PrivateFormat.PKCS8,serialization.NoEncryption())
+        escaped=pem.replace(b'\n',b'\\n')
+        for encoded in (pem,der,escaped,base64.b64encode(pem)):
+            loaded=load_signing_key(encoded)
+            self.assertEqual(loaded.private_numbers(),self.key.private_numbers())
+    def test_reject_malformed_signing_key(self):
+        with self.assertRaisesRegex(ValueError,'valid unencrypted PEM or DER'):
+            load_signing_key(b'not a private key')
 
 if __name__=='__main__': unittest.main()
