@@ -12,6 +12,7 @@
 #include <Arduino.h>
 #include <NetworkClientSecure.h>
 #include <new>
+#include <atomic>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <string.h>
@@ -348,6 +349,8 @@ struct Request {
 Request request;
 
 TaskHandle_t task;
+std::atomic<bool> updatePaused{false};
+std::atomic<bool> updateQuiescent{true};
 bool running;
 uint8_t volume127 = 90;
 bool autostart;
@@ -1515,6 +1518,15 @@ void radioTask(void *) {
   char url[RADIO_PLAY_URL_MAX] = {0};
 
   for (;;) {
+    if (updatePaused.load()) {
+      request.play = false;
+      request.changed = false;
+      setState(RADIO_IDLE);
+      updateQuiescent.store(true);
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
     // Pick up whatever was last asked for.
     if (request.changed) {
       request.changed = false;
@@ -1613,6 +1625,7 @@ bool ensureTask() {
 
 /// Hands the task a new destination. Safe from any task.
 void requestPlay(bool play, int8_t station, const char *url, const char *name) {
+  if (play && (updatePaused.load() || management_update_busy())) return;
   if (play && !ensureTask()) return;
   request.play = play;
   request.station = station;
@@ -1695,6 +1708,19 @@ bool net_radio_begin(void *out) {
   return true;
 }
 
+// Called by the control task; acknowledgement comes from the radio task only
+// after runStream has destroyed the decoder, TLS session, arena and history.
+void net_radio_update_pause(bool pause) {
+  if (pause) {
+    updateQuiescent.store(!task);
+    updatePaused.store(true);
+    net_radio_stop();
+  } else {
+    updatePaused.store(false);
+  }
+}
+bool net_radio_update_ready() { return updateQuiescent.load(); }
+
 bool net_radio_running() { return running; }
 
 bool net_radio_active() {
@@ -1745,7 +1771,7 @@ void net_radio_loop() {
    */
   static bool autostartDone;
   static uint32_t onlineSince;
-  if (!autostartDone && autostart && stationCount > 0) {
+  if (!autostartDone && autostart && stationCount > 0 && !management_update_busy()) {
     if (WiFi.status() != WL_CONNECTED) {
       onlineSince = 0;
     } else {
@@ -1799,7 +1825,7 @@ void net_radio_loop() {
 }
 
 bool net_radio_play_station(uint8_t index) {
-  if (!running || index >= stationCount) return false;
+  if (!running || index >= stationCount || management_update_busy()) return false;
   // Two sources on one jack. The module keeps playing otherwise, and the two
   // sum in the passive network at the output.
   if (df_player_running()) df_player_pause();
@@ -1818,6 +1844,7 @@ bool net_radio_play_station(uint8_t index) {
 }
 
 bool net_radio_play_url(const char *url, const char *name) {
+  if (management_update_busy()) return false;
   if (!running || !urlLooksPlayable(url)) return false;
   /*
    * Refused, not truncated.
@@ -1849,6 +1876,7 @@ void net_radio_stop() {
 }
 
 bool net_radio_toggle() {
+  if (management_update_busy()) return false;
   if (!running) return false;
   if (net_radio_active() || status.state == RADIO_CONNECTING ||
       status.state == RADIO_RECONNECTING) {

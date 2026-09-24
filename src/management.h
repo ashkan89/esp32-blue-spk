@@ -156,8 +156,8 @@ void management_store_audio();
  * timer task with a corrupted heap behind it.
  *
  * So the two take turns. The radio asks this before opening a stream and waits
- * out its backoff if the answer is yes; the updater asks the radio the same
- * question before it starts.
+ * out its backoff if the answer is yes. The updater stops radio playback and
+ * waits for the worker to release its stream resources before opening TLS.
  */
 bool management_update_busy();
 

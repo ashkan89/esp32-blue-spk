@@ -647,6 +647,10 @@ void ha_begin() {
 }
 
 void ha_loop() {
+  if (management_update_busy()) {
+    if (mqtt.connected()) mqtt.disconnect();
+    return;
+  }
   if (!started || !config.enabled) return;
   if (WiFi.status() != WL_CONNECTED) return;
 
@@ -681,6 +685,7 @@ void ha_announce() {
 }
 
 void ha_publish_state() {
+  if (management_update_busy()) return;
   if (!config.enabled || !mqtt.connected()) return;
   publishState();
   lastPublishMs = millis();

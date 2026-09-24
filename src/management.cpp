@@ -1,6 +1,9 @@
 #include "product.h"
 #include "time_shift.h"
 #include "ota_guard.h"
+#include "update_body.h"
+#include <atomic>
+#include <new>
 #include "app_config.h"
 #include "board_caps.h"
 #include "management.h"
@@ -27,6 +30,7 @@
 #include <mbedtls/gcm.h>
 #include <mbedtls/md.h>
 #include <mbedtls/platform_util.h>
+#include <mbedtls/ssl.h>
 #include <nvs_flash.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
@@ -855,12 +859,17 @@ int compareVersions(const String &left, const String &right) {
   return 0;
 }
 
+std::atomic<bool> githubJobActive{false};
+
 struct GithubJob {
   bool install;
   String repo;
   String pattern;
   String token;
 };
+
+GithubJob *pendingGithubJob = nullptr;
+uint32_t pendingGithubSince = 0;
 
 struct GithubRelease {
   String tag;
@@ -895,13 +904,42 @@ void prepareRequest(HTTPClient &http, const String &url, const String &token) {
   // Nothing here reuses a connection: every request in this file goes to a
   // different host from the one before it.
   http.setReuse(false);
+  http.addHeader("Accept-Encoding", "identity");
+  static const char *headers[] = {"Transfer-Encoding", "Content-Encoding"};
+  http.collectHeaders(headers, 2);
   if (token.length() && isGithubHost(url)) {
     http.addHeader("Authorization", "Bearer " + token);
   }
 }
 
+constexpr int MAX_REDIRECTS = 5;
+constexpr int CONNECT_ATTEMPTS = 3;
+struct UpdateClock {
+  uint32_t now() { return millis(); }
+  void idle() { delay(1); }
+};
+using GithubBody = UpdateBody<NetworkClient, UpdateClock>;
+
+bool responseEncoding(HTTPClient &http, bool &chunked, String &error) {
+  const String encoding = http.header("Content-Encoding");
+  const String transfer = http.header("Transfer-Encoding");
+  chunked = transfer.equalsIgnoreCase("chunked");
+  if ((encoding.length() && !encoding.equalsIgnoreCase("identity")) ||
+      (transfer.length() && !chunked && !transfer.equalsIgnoreCase("identity"))) {
+    error = "Unsupported HTTP response encoding";
+    return false;
+  }
+  return true;
+}
+
+bool retryHttpStatus(int code) {
+  return code < 0 || code == 408 || code == 429 || code >= 500;
+}
+
 // ------------------------------------------------------------- metadata -----
-bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error) {
+bool fetchLatestReleaseOnce(const GithubJob &job, GithubRelease &out, String &error,
+                            bool &retryable) {
+  retryable = false;
   NetworkClientSecure tls;
   trustPublicRoots(tls);
   HTTPClient http;
@@ -911,11 +949,7 @@ bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error)
     error = "Could not initialize HTTPS";
     return false;
   }
-  // ArduinoJson consumes the body stream directly. GitHub is allowed to use
-  // HTTP/1.1 chunked transfer encoding, but HTTPClient's raw stream still
-  // contains the chunk framing; the first hexadecimal chunk size then looks
-  // like invalid JSON. HTTP/1.0 makes GitHub return an unchunked, close-delimited
-  // body without buffering the roughly 20 KB release document in RAM.
+  // Prefer an unchunked response, but decode chunked framing if sent anyway.
   http.useHTTP10(true);
   prepareRequest(http, api, job.token);
   http.addHeader("Accept", "application/vnd.github+json");
@@ -923,6 +957,7 @@ bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error)
 
   const int code = http.GET();
   if (code != HTTP_CODE_OK) {
+    retryable = retryHttpStatus(code);
     if (code == HTTP_CODE_NOT_FOUND) {
       error = "No releases found for " + job.repo;
     } else {
@@ -932,6 +967,16 @@ bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error)
     return false;
   }
 
+  bool chunked = false;
+  if (!responseEncoding(http, chunked, error)) return false;
+  constexpr size_t metadataLimit = 256 * 1024;
+  if (http.getSize() > (int)metadataLimit) {
+    error = "GitHub metadata exceeds 256 KB limit";
+    return false;
+  }
+  UpdateClock clock;
+  GithubBody body(http.getStream(), clock, chunked ? -1 : http.getSize(),
+                  chunked, metadataLimit, 30000, 120000);
   JsonDocument filter;
   filter["tag_name"] = true;
   filter["name"] = true;
@@ -941,12 +986,30 @@ bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error)
   filter["assets"][0]["size"] = true;
   JsonDocument release;
   const DeserializationError jsonError = deserializeJson(
-      release, http.getStream(), DeserializationOption::Filter(filter));
+      release, body, DeserializationOption::Filter(filter));
   if (jsonError) {
-    error = String("Could not parse GitHub release metadata: ") +
-            jsonError.c_str();
+    retryable = jsonError == DeserializationError::IncompleteInput ||
+                jsonError == DeserializationError::EmptyInput;
+    error = body.error() ? String(body.error())
+                        : String("Could not parse GitHub metadata: ") + jsonError.c_str();
     return false;
   }
+  // ArduinoJson stops at the closing brace. Require the entire HTTP body,
+  // including the final chunk/trailers, before trusting that result.
+  int tail;
+  while ((tail = body.read()) >= 0) {
+    if (tail != ' ' && tail != '\r' && tail != '\n' && tail != '\t') {
+      error = "Unexpected data after GitHub metadata";
+      return false;
+    }
+  }
+  if (!body.complete()) {
+    retryable = true;
+    error = body.error() ? body.error() : "Incomplete GitHub metadata response";
+    return false;
+  }
+  http.end();
+  tls.stop(); // Free TLS before copying the selected release strings.
 
   if (!release["tag_name"].is<const char *>() ||
       !release["assets"].is<JsonArray>()) {
@@ -968,125 +1031,170 @@ bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error)
       break;
     }
   }
-  if (!out.assetUrl.length()) {
+  if (!out.assetUrl.startsWith("https://") || !out.assetSize) {
     error = "No release firmware matched the asset pattern";
     return false;
   }
   return true;
 }
 
+bool fetchLatestRelease(const GithubJob &job, GithubRelease &out, String &error) {
+  for (int attempt = 1; attempt <= CONNECT_ATTEMPTS; ++attempt) {
+    bool retryable = false;
+    out = GithubRelease{};
+    if (fetchLatestReleaseOnce(job, out, error, retryable)) return true;
+    if (!retryable || attempt == CONNECT_ATTEMPTS) return false;
+    // The failed request's TLS context and JSON documents are already gone.
+    updateSet("checking", "GitHub response interrupted; retrying", true);
+    delay(500 * attempt);
+  }
+  return false;
+}
+
 // -------------------------------------------------------------- install -----
-bool flashFromStream(HTTPClient &http, String &error) {
+bool flashFromStream(HTTPClient &http, size_t expectedSize, String &error,
+                     bool &retryable) {
+  bool chunked = false;
+  if (!responseEncoding(http, chunked, error)) return false;
   const int contentLength = http.getSize();
-  if (contentLength <= 0) {
-    error = "Release asset did not declare a size";
+  if (!expectedSize || expectedSize > ESP.getFreeSketchSpace() + 172u ||
+      (!chunked && contentLength >= 0 && (size_t)contentLength != expectedSize)) {
+    error = "Firmware response size does not match the release package";
     return false;
   }
-  if ((size_t)contentLength > ESP.getFreeSketchSpace()) {
-    error = String("Firmware is ") + contentLength + " B; the OTA slot holds " +
-            (unsigned)ESP.getFreeSketchSpace() + " B";
-    return false;
-  }
+  UpdateClock clock;
+  GithubBody body(http.getStream(), clock, chunked ? -1 : contentLength,
+                  chunked, expectedSize, 30000, 600000);
   ota_package_begin();
-  auto &input = http.getStream();
+  updateProgress(0, expectedSize);
   uint8_t block[1024];
   size_t received = 0;
-  uint32_t lastData = millis();
-  while (received < (size_t)contentLength) {
-    if (input.available()) {
-      const size_t n = input.readBytes(block, min(sizeof(block), (size_t)contentLength - received));
-      if (!n || !ota_package_write(block, n)) {
-        error = ota_package_error(); ota_package_abort(); return false;
+  for (;;) {
+    const size_t n = body.readBytes(reinterpret_cast<char *>(block), sizeof(block));
+    if (n) {
+      if (!ota_package_write(block, n)) {
+        error = ota_package_error();
+        ota_package_abort();
+        return false; // Invalid signatures/images are never retried.
       }
-      received += n; lastData = millis();
-      updateProgress(received, contentLength);
-    } else if (millis() - lastData > 15000) {
-      error = "Firmware transfer timed out"; ota_package_abort(); return false;
+      received += n;
+      updateProgress(received, expectedSize);
+      delay(1);
     }
-    delay(1);
+    if (n < sizeof(block)) break;
   }
+  if (!body.complete() || received != expectedSize) {
+    error = body.error() ? body.error() : "Firmware transfer ended early";
+    retryable = true;
+    ota_package_abort();
+    return false;
+  }
+  // Only select the new boot partition after the complete signed image arrived.
   if (!ota_package_end()) {
     error = ota_package_error(); ota_package_abort(); return false;
   }
   return true;
 }
 
-/*
- * Where the install used to fail.
- *
- * browser_download_url points at github.com, which answers 302 with a signed,
- * time-limited URL on a storage host with a different name and a different
- * certificate chain. HTTPClient will follow that by itself, but it does it by
- * switching hosts underneath a live NetworkClientSecure: stop the socket,
- * reconnect the same mbedtls context to a different name. The check reached
- * api.github.com and the next handshake came back as HTTP -1 -- a refused
- * connection, which is what a handshake that never completes looks like from
- * up here.
- *
- * So the redirect is followed by hand. Each hop constructs its own client in
- * its own scope, which means every handshake starts from a clean context, only
- * one TLS session is ever allocated at a time, and the token stays with
- * github.com rather than being forwarded to a storage host that rejects
- * requests carrying two sets of credentials.
- */
-constexpr int MAX_REDIRECTS = 5;
-constexpr int CONNECT_ATTEMPTS = 3;
-
-bool downloadAndFlash(const String &startUrl, const String &token, String &error) {
+bool downloadAndFlashOnce(const String &startUrl, const String &token,
+                          size_t expectedSize, String &error, bool &retryable) {
+  retryable = false;
   String url = startUrl;
-
   for (int hop = 0; hop <= MAX_REDIRECTS; ++hop) {
-    for (int attempt = 1; attempt <= CONNECT_ATTEMPTS; ++attempt) {
-      NetworkClientSecure tls;
-      trustPublicRoots(tls);
-      HTTPClient http;
-      http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
-      if (!http.begin(tls, url)) {
-        error = "Could not initialize firmware download";
-        return false;
-      }
-      prepareRequest(http, url, token);
-      http.addHeader("Accept", "application/octet-stream");
-
-      const int code = http.GET();
-      if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
-          code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT ||
-          code == HTTP_CODE_PERMANENT_REDIRECT) {
-        const String next = http.getLocation();
-        if (!next.startsWith("https://")) {
-          error = "Release download redirected off HTTPS";
-          return false;
-        }
-        LOGF("[ota] redirect %d -> %.60s\n", code, next.c_str());
-        url = next;
-        break;  // next hop, with a fresh client
-      }
-
-      if (code == HTTP_CODE_OK) return flashFromStream(http, error);
-
-      // A negative code never reached the server: DNS, TCP or TLS. Those are
-      // worth one more try -- a redirect to a storage host is signed and only
-      // valid for a few minutes, but three attempts fit inside that window.
-      // An HTTP status did reach us, and retrying it would say the same thing.
-      if (code >= 0 || attempt == CONNECT_ATTEMPTS) {
-        error = "Firmware download failed: " + httpErrorText(code);
-        if (code < 0) error += heapNote();
-        return false;
-      }
-      LOGF("[ota] %s, retrying (%d/%d)\n",
-                    httpErrorText(code).c_str(), attempt + 1, CONNECT_ATTEMPTS);
-      delay(1000);
+    // Each redirect gets its own TLS context. No two sessions coexist.
+    NetworkClientSecure tls;
+    trustPublicRoots(tls);
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_DISABLE_FOLLOW_REDIRECTS);
+    if (!http.begin(tls, url)) {
+      error = "Could not initialize firmware download";
+      return false;
     }
+    prepareRequest(http, url, token);
+    http.addHeader("Accept", "application/octet-stream");
+    const int code = http.GET();
+    if (code == HTTP_CODE_MOVED_PERMANENTLY || code == HTTP_CODE_FOUND ||
+        code == HTTP_CODE_SEE_OTHER || code == HTTP_CODE_TEMPORARY_REDIRECT ||
+        code == HTTP_CODE_PERMANENT_REDIRECT) {
+      const String next = http.getLocation();
+      if (!next.startsWith("https://")) {
+        error = "Release download redirected off HTTPS";
+        return false;
+      }
+      url = next;
+      continue;
+    }
+    if (code == HTTP_CODE_OK)
+      return flashFromStream(http, expectedSize, error, retryable);
+    retryable = retryHttpStatus(code);
+    error = "Firmware download failed: " + httpErrorText(code);
+    if (code < 0) error += heapNote();
+    return false;
   }
-
   error = "Release download redirected too many times";
   return false;
 }
 
+bool downloadAndFlash(const String &startUrl, const String &token,
+                      size_t expectedSize, String &error) {
+  for (int attempt = 1; attempt <= CONNECT_ATTEMPTS; ++attempt) {
+    bool retryable = false;
+    if (downloadAndFlashOnce(startUrl, token, expectedSize, error, retryable)) return true;
+    if (!retryable || attempt == CONNECT_ATTEMPTS) return false;
+    // Restart from GitHub for a fresh signed redirect URL and a fresh OTA write.
+    updateSet("downloading", "Download interrupted; restarting transfer", true);
+    delay(500 * attempt);
+  }
+  return false;
+}
+
+// TLS needs two separate record buffers, not one 45 KB allocation. Probe
+// both simultaneously in byte-addressable internal RAM, with headroom for
+// the certificate chain, network and dashboard. Run inside the worker so its
+// 16 KB stack is already accounted for. This is admission, not a guarantee:
+// the real handshake still handles allocation failure normally.
+bool githubTlsMemoryAvailable() {
+  constexpr uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+  constexpr size_t inputBytes = MBEDTLS_SSL_IN_CONTENT_LEN + 2048;
+  constexpr size_t outputBytes = MBEDTLS_SSL_OUT_CONTENT_LEN + 2048;
+  constexpr size_t reserveBytes = 28000;
+  const size_t freeBytes = heap_caps_get_free_size(caps);
+  const size_t largest = heap_caps_get_largest_free_block(caps);
+  bool fits = false;
+  if (freeBytes >= inputBytes + outputBytes + reserveBytes) {
+    void *input = heap_caps_malloc(inputBytes, caps);
+    void *output = input ? heap_caps_malloc(outputBytes, caps) : nullptr;
+    fits = input && output && heap_caps_get_free_size(caps) >= reserveBytes;
+    heap_caps_free(output);
+    heap_caps_free(input);
+  }
+  if (!fits) {
+    // Keep the recovery advice inside UpdateState's 128-byte message buffer.
+    char message[128];
+    snprintf(message, sizeof(message),
+             "TLS memory low (%u B free, %u B block). Stop audio and retry, "
+             "or upload firmware locally.",
+             (unsigned)freeBytes, (unsigned)largest);
+    updateSet("error", message, false);
+  }
+  return fits;
+}
+
 // ------------------------------------------------------------------ job -----
 void runGithubJob(const GithubJob &job) {
-  updateSet("checking", "Contacting GitHub releases", true);
+  updateSet("checking", "Waiting for audio memory to be released", true);
   updateProgress(0, 0);
+
+  const uint32_t waitingSince = millis();
+  while (!net_radio_update_ready()) {
+    if (millis() - waitingSince >= 45000) {
+      updateSet("error", "Audio did not stop in time; retry the update", false);
+      return;
+    }
+    delay(20);
+  }
+  if (!githubTlsMemoryAvailable()) return;
+  updateSet("checking", "Contacting GitHub releases", true);
 
   GithubRelease release;
   String error;
@@ -1132,7 +1240,15 @@ void runGithubJob(const GithubJob &job) {
                 release.tag.c_str(), release.assetName.c_str(),
                 (unsigned)release.assetSize, (unsigned)ESP.getFreeHeap());
 
-  if (!downloadAndFlash(release.assetUrl, job.token, error)) {
+  // The dashboard already owns fixed-size copies of these fields. Only the
+  // asset URL and size are needed while the next TLS session and OTA writer run.
+  release.tag = String();
+  release.name = String();
+  release.url = String();
+  release.assetName = String();
+  if (!githubTlsMemoryAvailable()) return;
+
+  if (!downloadAndFlash(release.assetUrl, job.token, release.assetSize, error)) {
     LOGF("[ota] %s\n", error.c_str());
     updateSet("error", error.c_str(), false);
     return;
@@ -1151,89 +1267,65 @@ void githubTask(void *raw) {
     std::unique_ptr<GithubJob> job((GithubJob *)raw);
     runGithubJob(*job);
   }
+  // Keep ownership until all TLS/JSON objects have been destroyed. On success
+  // leave services parked until the scheduled reboot.
+  if (strcmp(updateSnapshot().phase, "success") != 0) {
+    net_radio_update_pause(false);
+    githubJobActive.store(false);
+  }
   vTaskDelete(nullptr);
 }
 
 
-/*
- * A TLS session against the root bundle needs roughly 45 KB, and it needs a
- * good part of it in one piece: two mbedtls record buffers, the session
- * context, and the server's certificate chain while it is being parsed. Failing
- * that allocation surfaces as HTTPClient's HTTP -1, which reads as a network
- * problem and sends you looking in the wrong place. Refuse in words instead.
- */
-/*
- * What a TLS handshake against the root bundle actually needs.
- *
- * These were 60000/34000, which is what the handshake costs on paper. In the
- * field a speaker with 108 kB free and a 106 kB block sailed past that check
- * and then failed inside mbedtls with "SSL - Memory allocation failed" --
- * because between the check and the handshake, the internet radio opened a
- * second TLS session for an https station and took the room.
- *
- * The arbitration below is the real fix for that. These went up anyway: the
- * check has to leave enough for the network stack and the web server to keep
- * working underneath it, not merely enough to complete if nothing else moves.
- */
-constexpr uint32_t TLS_HEAP_FLOOR = 80000;
-constexpr uint32_t TLS_BLOCK_FLOOR = 45000;
+// Control-task service: do not reserve a 16 KB TLS worker stack until the radio
+// has released its decoder, TLS session and buffers. A stop request alone is
+// asynchronous and those allocations can still be live when the API returns.
+void servicePendingGithubJob() {
+  if (!pendingGithubJob) return;
+  const bool ready = net_radio_update_ready();
+  if (!ready && millis() - pendingGithubSince < 45000) return;
+  GithubJob *job = pendingGithubJob;
+  pendingGithubJob = nullptr;
+  if (ready && xTaskCreatePinnedToCore(githubTask, "github_ota", 16384, job,
+                                     1, nullptr, 0) == pdPASS) return;
+  delete job;
+  net_radio_update_pause(false);
+  githubJobActive.store(false);
+  updateSet("error", ready ? "Could not start update task"
+                           : "Audio did not stop in time; retry the update", false);
+}
 
 bool startGithubJob(bool install) {
   const UpdateState u = updateSnapshot();
-  if (u.busy) return false;
+  if (u.busy || githubJobActive.load()) return false;
   if (WiFi.status() != WL_CONNECTED) {
     updateSet("error", "Internet connection required", false);
-    return false;
-  }
-  /*
-   * Not while the radio has a stream open, and not while it is trying to open
-   * one either. Both hold a socket and a decoder, and an https station holds a
-   * whole second TLS context -- which is the collision that used to crash the
-   * board rather than merely fail.
-   */
-  if (net_radio_running()) {
-    RadioStatus r;
-    net_radio_snapshot(&r);
-    if (r.state != RADIO_IDLE && r.state != RADIO_ERROR) {
-      updateSet("error",
-                "The internet radio is using the network. Stop it on the Radio "
-                "page and check again -- there is room on this chip for one "
-                "secure connection at a time, not two.",
-                false);
-      return false;
-    }
-  }
-
-  const uint32_t heap = ESP.getFreeHeap();
-  const uint32_t block = ESP.getMaxAllocHeap();
-  if (heap < TLS_HEAP_FLOOR || block < TLS_BLOCK_FLOOR) {
-    // Naming the one thing that is probably holding the memory beats telling
-    // somebody to restart a speaker that will do exactly the same thing again.
-    String message = String("Not enough memory for a secure connection (") +
-                     (unsigned)heap + " B free, largest block " +
-                     (unsigned)block + " B). ";
-    message += net_radio_active()
-                   ? "Stop the internet radio and try again -- a stream holds "
-                     "the decoder and its buffer for as long as it is playing."
-                   : "Restart the speaker and try again before playing anything.";
-    updateSet("error", message.c_str(), false);
     return false;
   }
   if (settings.githubRepo.indexOf('/') <= 0 || settings.githubAsset.length() == 0) {
     updateSet("error", "Configure owner/repository and an asset pattern first", false);
     return false;
   }
-  GithubJob *job = new GithubJob{install, settings.githubRepo, settings.githubAsset,
-                                 settings.githubToken};
-  // 16 KB. A TLS handshake that walks a certificate chain against the Mozilla
-  // root bundle is the deepest thing this firmware does and the OTA writer runs
-  // on top of it, so 14 KB was tight -- but a task stack comes out of the same
-  // heap the handshake then has to allocate from, and this margin is not free.
-  if (xTaskCreatePinnedToCore(githubTask, "github_ota", 16384, job, 1, nullptr, 0) != pdPASS) {
-    delete job;
-    updateSet("error", "Could not start update task", false);
+  githubJobActive.store(true);
+  updateSet("checking", "Stopping audio and preparing update", true);
+  net_radio_update_pause(true);
+  product_noise_stop();
+  voice_silence();
+  if (sink && sink->is_connected()) sink->pause();
+  // These services belong to the control task. Stop them here, not in the
+  // worker, and their loops will reconnect after update ownership is released.
+  dlna_stop();
+  ha_loop();
+  GithubJob *job = new (std::nothrow) GithubJob{
+      install, settings.githubRepo, settings.githubAsset, settings.githubToken};
+  if (!job) {
+    net_radio_update_pause(false);
+    githubJobActive.store(false);
+    updateSet("error", "Could not allocate update job", false);
     return false;
   }
+  pendingGithubJob = job;
+  pendingGithubSince = millis();
   return true;
 }
 
@@ -4801,7 +4893,7 @@ void handleUploadChunk(HTTPRaw &upload) {
         server.header("X-Firmware-Size").c_str(), nullptr, 10);
     strlcpy(browserUploadError, "Upload could not be started", sizeof(browserUploadError));
     const UpdateState u = updateSnapshot();
-    if (u.busy) {
+    if (u.busy || githubJobActive.load()) {
       strlcpy(browserUploadError, "Another update is already in progress",
               sizeof(browserUploadError));
       return;
@@ -5165,7 +5257,7 @@ void management_factory_reset() {
 
 void management_set_bt_active(bool active) { btActive = active; }
 
-bool management_update_busy() { return updateSnapshot().busy; }
+bool management_update_busy() { return githubJobActive.load() || updateSnapshot().busy; }
 
 bool management_media_action(const char *action, int value) {
   if (!action || !action[0]) return false;
@@ -5462,6 +5554,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
 }
 
 void management_loop() {
+  servicePendingGithubJob();
   // Before the mode check: every mode has to be able to clear its own strike,
   // including the ones that return immediately below.
   if (bootStrikePending && millis() > BOOT_STABLE_MS) {

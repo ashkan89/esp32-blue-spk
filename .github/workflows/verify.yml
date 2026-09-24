@@ -26,11 +26,13 @@ jobs:
       - run: npm test
       - run: python scripts/test_native.py
       - run: python scripts/test_led_output.py
+      - run: python scripts/test_update_memory.py
       - run: python scripts/test_release_package.py
       - run: python scripts/test_catalog.py
       - run: python scripts/test_settings_backup.py
       - run: python scripts/test_arabic_shaping.py
       - run: python -m platformio run -j 3 -e esp32_wroom_32d_16mb -e esp32_wrover_e_n16r8 -e esp32_wroom_32d_16mb_release -e esp32_wrover_e_n16r8_release
+      - run: python scripts/test_update_transport.py
       - run: python scripts/test_helix_guard.py
       - run: python scripts/test_pin_check.py
       - run: python scripts/test_partitions.py

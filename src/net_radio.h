@@ -234,6 +234,10 @@ bool net_radio_play_url(const char *url, const char *name);
 /// Stops, and remembers that stopping is what was wanted, so the reconnect
 /// logic does not immediately undo it.
 void net_radio_stop();
+/// Park playback for an update; ready means the worker has released its stream.
+/// Releasing the pause permits future play requests, without restarting audio.
+void net_radio_update_pause(bool pause);
+bool net_radio_update_ready();
 
 /// Stop if playing, start the last station if not. What the OLED button and the
 /// dashboard's play/pause control do. A stream has no pause -- the audio that
@@ -346,6 +350,8 @@ inline void net_radio_snapshot(RadioStatus *out) {
 inline bool net_radio_play_station(uint8_t) { return false; }
 inline bool net_radio_play_url(const char *, const char *) { return false; }
 inline void net_radio_stop() {}
+inline void net_radio_update_pause(bool) {}
+inline bool net_radio_update_ready() { return true; }
 inline bool net_radio_toggle() { return false; }
 inline bool net_radio_step_station(bool) { return false; }
 inline void net_radio_set_volume(uint8_t) {}

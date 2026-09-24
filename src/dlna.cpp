@@ -1881,6 +1881,7 @@ void dlna_stop() {
 }
 
 void dlna_loop() {
+  if (management_update_busy()) { dlna_stop(); return; }
   if (!running) {
     // Come up as soon as the station has an address, without anything else
     // having to know when that happened -- and no more than once every five
