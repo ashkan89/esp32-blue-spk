@@ -1363,7 +1363,6 @@ void setup() {
    * question.
    */
   board_caps_begin();
-  heap_guard_begin();
 
   status_led_begin(PIN_STATUS_LED, STATUS_LED_ACTIVE_HIGH);
 
@@ -1449,6 +1448,9 @@ void setup() {
   // reconfigured in the middle of an A2DP stream. Connection is asynchronous;
   // an unreachable network falls back to the setup AP after 15 seconds.
   management_begin(a2dp_sink);
+  // The network corruption monitor walks all heaps on core 0 every 200 ms.
+  // Bluetooth needs that core and internal RAM for its controller tasks.
+  if (radio_mode_has_wifi(management_radio_mode())) heap_guard_begin();
   product_begin();
   // The number that decides whether the rest of this boot can succeed: what is
   // left once Wi-Fi has taken its share. In Bluetooth mode the sink has not
@@ -1497,16 +1499,12 @@ void setup() {
   service_bluetooth_start();
 
   /*
-   * The history ring, the alarms and the announcements: every mode, including
-   * Bluetooth.
-   *
-   * None of the three needs a network. The alarm runs on soft_clock, the
-   * announcements are in flash, and the graph history is what makes a battery
-   * that died overnight explicable in the morning -- and Bluetooth mode, which
-   * has no dashboard, is the mode where a spoken battery warning is the only
-   * warning there is.
+   * Alarms and announcements also work offline: the clock is local and the
+   * clips are in flash. Battery warnings remain available in Bluetooth mode.
+   * The dashboard history ring is allocated only in network modes.
    */
-  telemetry_begin();
+  // History is consumed by the dashboard, which does not exist offline.
+  if (radio_mode_has_wifi(management_radio_mode())) telemetry_begin();
   alarm_set_hooks(alarm_set_volume, alarm_chime, alarm_stop_audio);
   alarm_begin();
   audio_eq_set_sample_rate(SAMPLE_RATE);
@@ -1612,6 +1610,7 @@ void setup() {
   if (have_leds) leds_start();
 
   LOGLN("Type 'help' for the serial commands (clock, screens, radio).");
+  // Confirm trial firmware offline too; this starts no network/update service.
   ota_health_begin(audioReady);
 }
 
@@ -1655,13 +1654,15 @@ void loop() {
   log_state_changes();
   soft_clock_tick();
   management_loop();
-  df_player_loop();
-  net_radio_loop();
-  dlna_loop();
+  if (radio_mode_has_dfplayer(management_radio_mode())) df_player_loop();
+  if (radio_mode_has_wifi(management_radio_mode())) {
+    net_radio_loop();
+    dlna_loop();
+    telemetry_loop();
+  }
   // After the sources have published their state, so an alarm that starts one
   // sees it running on the same pass rather than the next.
   alarm_loop();
-  telemetry_loop();
   product_loop();
   if (product_take_focus_cue() && !dac_busy()) { melodyVolume = product_start_volume(); pending_melody = MELODY_ID_NOTIFY; }
   service_soundscape();

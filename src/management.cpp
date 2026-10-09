@@ -210,8 +210,9 @@ RadioMode radioMode = RADIO_MODE_MANAGEMENT;
  * So each boot into a mode other than Wi-Fi writes a strike to NVS before it
  * tries anything, and clears it once the speaker has been up long enough to
  * call it stable. Two boots that never reach that point and the next one falls
- * back to Wi-Fi mode, where the dashboard is reachable and the mode can be
- * changed again. The count survives a reset by construction: that is the whole
+ * back to Wi-Fi mode for DFPlayer. Bluetooth stays offline after failures;
+ * enabling Wi-Fi requires an explicit mode change. The count survives a reset:
+ * that is the whole
  * point of keeping it in flash rather than in RAM.
  */
 constexpr uint8_t BOOT_STRIKES_MAX = 2;
@@ -1324,6 +1325,10 @@ void servicePendingGithubJob() {
 }
 
 bool startGithubJob(bool install) {
+  if (!radio_mode_has_wifi(radioMode)) {
+    updateSet("error", "Updates are disabled in Bluetooth mode", false);
+    return false;
+  }
   const UpdateState u = updateSnapshot();
   if (u.busy || githubJobActive.load()) return false;
   if (WiFi.status() != WL_CONNECTED) {
@@ -5464,7 +5469,7 @@ void management_begin(BluetoothA2DPSink &a2dp) {
   bootStrikes = prefs.getUChar("bootFail", 0);
   if (radioMode == RADIO_MODE_MANAGEMENT) {
     if (bootStrikes) prefs.putUChar("bootFail", 0);
-  } else if (bootStrikes >= BOOT_STRIKES_MAX) {
+  } else if (radioMode != RADIO_MODE_BLUETOOTH && bootStrikes >= BOOT_STRIKES_MAX) {
     LOGF("[mode] %s mode failed to stay up %u times in a row. Falling "
                   "back to Wi-Fi mode so the dashboard is reachable; pick a "
                   "mode again from there once you know why.\n",
@@ -5475,7 +5480,12 @@ void management_begin(BluetoothA2DPSink &a2dp) {
     prefs.putUChar("radioMode", (uint8_t)radioMode);
     prefs.putUChar("bootFail", 0);
   } else {
-    prefs.putUChar("bootFail", (uint8_t)(bootStrikes + 1));
+    if (bootStrikes >= BOOT_STRIKES_MAX) {
+      LOGLN("[mode] repeated Bluetooth boot failures; keeping Wi-Fi off. "
+            "Use BOOT to switch modes; check the reset reason above.");
+    }
+    prefs.putUChar("bootFail", (uint8_t)(bootStrikes < BOOT_STRIKES_MAX
+                                          ? bootStrikes + 1 : BOOT_STRIKES_MAX));
     bootStrikePending = true;
   }
 
@@ -5497,9 +5507,9 @@ void management_begin(BluetoothA2DPSink &a2dp) {
    * Both are in the sample path in Bluetooth mode, which has no dashboard to
    * configure them from -- so a curve dialled in over Wi-Fi has to be picked up
    * here or it would only apply in the mode it was set in. The Home Assistant
-   * client is configured at the same time because it reads its settings from
-   * the same blob; it does nothing until ha_begin(), which only the Wi-Fi modes
-   * reach.
+   * settings are copied at the same time so saving audio settings offline keeps
+   * the broker configuration. The MQTT client itself is created lazily on the
+   * first connection attempt, which only Wi-Fi modes reach.
    */
   applyAudioSettings();
 
@@ -5606,7 +5616,6 @@ void management_begin(BluetoothA2DPSink &a2dp) {
 }
 
 void management_loop() {
-  servicePendingGithubJob();
   // Before the mode check: every mode has to be able to clear its own strike,
   // including the ones that return immediately below.
   if (bootStrikePending && millis() > BOOT_STABLE_MS) {
@@ -5620,6 +5629,7 @@ void management_loop() {
   serviceSettingsPersistence();
 
   if (!radio_mode_has_wifi(radioMode)) return;
+  servicePendingGithubJob();
 
   // Marked so a stall in loop() can be told apart from one in the renderer.
   // NetworkClient::write() retries a peer that is not reading ten times with a

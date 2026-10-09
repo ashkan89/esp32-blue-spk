@@ -7,6 +7,7 @@
 #include <cstring>
 #include <strings.h>
 #include <string>
+#include <optional>
 
 using String = std::string;
 struct LedConfig {
@@ -22,6 +23,7 @@ static constexpr int RADIO_PLAY_URL_MAX = 300;
 static EqConfig eq{};
 static LedConfig ring{};
 static Alarm alarm{};
+static unsigned wifiReads, updateReads, mqttConstructions;
 static unsigned mutations, states, updates, announcements, snoozes, dismisses;
 static bool busy, inCallback, connected = true, started = true, announcePending;
 static bool installed, autostart;
@@ -101,12 +103,12 @@ bool alarm_set(uint8_t, const Alarm &a) { alarm = a; ++mutations; return true; }
 bool alarm_trigger(uint8_t) { ++mutations; return true; }
 bool publishState() { ++states; return true; }
 bool publishUpdate();
-bool management_update_busy() { return busy; }
+bool management_update_busy() { ++updateReads; return busy; }
 static constexpr int WL_CONNECTED = 3;
-struct { int status() { return WL_CONNECTED; } } WiFi;
+struct { int status() { ++wifiReads; return WL_CONNECTED; } } WiFi;
 uint32_t millis() { return 100; }
 bool serviceDiscovery() { return false; }
-bool connectBroker() { connected = true; return true; }
+bool connectBroker();
 void ha_announce() { ++announcements; }
 void ha_loop();
 bool management_update_request(bool install) {
@@ -116,7 +118,9 @@ bool management_update_request(bool install) {
   return true;
 }
 static void (*callback)();
-struct {
+int net;
+struct PubSubClient {
+  explicit PubSubClient(int &) { ++mqttConstructions; }
   bool connected() { return ::connected; }
   void disconnect() { ::connected = false; }
   bool publish(const char *topic, const char *payload, bool) {
@@ -129,7 +133,9 @@ struct {
     inCallback = false;
     return true;
   }
-} mqtt;
+};
+// MQTT_LAZY_FUNCTIONS
+bool connectBroker() { mqtt(); connected = true; return true; }
 
 // The test runner inserts the actual firmware callback and loop here.
 // FIRMWARE_FUNCTIONS
@@ -139,6 +145,18 @@ void send(const char *suffix, const char *payload) {
   onMessage(topic.data(), (uint8_t *)payload, strlen(payload));
 }
 int main() {
+  // An offline client, even while an update is flagged, must allocate nothing
+  // and must not query the network or update service from the MQTT loop.
+  assert(!mqttClient && mqttConstructions == 0 && !mqttConnected());
+  started = false; busy = true; config.enabled = true;
+  ha_loop();
+  assert(!mqttClient && mqttConstructions == 0 && wifiReads == 0 && updateReads == 0);
+  started = true; config.enabled = false;
+  ha_loop();
+  assert(!mqttClient && wifiReads == 0 && updateReads == 0);
+  config.enabled = true; busy = false;
+  mqtt(); mqtt();
+  assert(mqttConstructions == 1 && mqttConnected());
   int value; bool on;
   assert(mqtt_integer("-12", -12, 12, &value) && value == -12);
   assert(mqtt_integer("43200", 10, 43200, &value) && value == 43200);

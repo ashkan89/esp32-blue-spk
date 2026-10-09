@@ -135,6 +135,10 @@ void ota_health_tick() {
   const bool memoryOk = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) > 12000 &&
       heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) > 4000;
   if (!ready || !memoryOk) {
+    LOGF("[boot] trial firmware failed: hardware ready %u, internal heap %u "
+         "free, %u largest; rolling back\n", (unsigned)ready,
+         (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+         (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     health = "Trial failed; restoring previous firmware";
     esp_ota_mark_app_invalid_rollback_and_reboot();
     return;

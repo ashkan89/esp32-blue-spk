@@ -3826,7 +3826,7 @@ What the whole bundle adds, measured from the linked image:
 | Static DRAM, whole firmware | 84.5 kB → 89.4 kB |
 | IRAM | **zero** — nothing here, nor libhelix, nor PubSubClient, is in IRAM |
 | Heap at boot (Wi-Fi modes) | 3.8 kB — the history ring and the station list |
-| Heap at boot (Bluetooth mode) | 1.4 kB — the history ring only |
+| Heap at boot (Bluetooth mode) | No dashboard history ring or MQTT client allocation |
 | Flash | +620 kB, of which 355 kB is the recorded speech |
 
 Everything else is claimed when it is used and given back afterwards: the radio's
@@ -4588,3 +4588,19 @@ group — most of the pass criteria below are one line of that report.
 
   If you ever build this for a WROVER **and enable PSRAM**, delete the
   `build_unflags` block: there the workaround is doing a real job.
+
+
+### Bluetooth-only service isolation
+
+Bluetooth mode leaves Wi-Fi uninitialized and starts no dashboard, Home Assistant
+connection, internet radio, DLNA renderer, or update worker. It also skips the
+periodic heap-monitor task and dashboard history ring. MQTT client construction
+is deferred until the first broker connection attempt in a network mode. Audio,
+display, lights, physical controls, the local clock, alarms, and battery protection
+continue to work offline.
+
+Repeated failed Bluetooth boots keep the selected mode offline. Hold BOOT to
+switch to Wi-Fi explicitly. The serial boot log reports the reset reason; trial
+firmware rollback also logs hardware readiness and internal heap totals. The
+bootloader health confirmation still runs offline after flashing a trial image;
+it does not start an updater or use the network.

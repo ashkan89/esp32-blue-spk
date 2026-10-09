@@ -6,6 +6,7 @@
 #include <PubSubClient.h>
 #include <WiFi.h>
 #include <string.h>
+#include <optional>
 
 #include "alarm_clock.h"
 #include "audio_eq.h"
@@ -49,7 +50,14 @@ const uint32_t RECONNECT_MAX_MS = 120000;
 const uint8_t DISCOVERY_PER_PASS = 3;
 
 WiFiClient net;
-PubSubClient mqtt(net);
+// PubSubClient allocates its packet buffer in the constructor. Do not create
+// it during static initialization: an offline boot never needs an MQTT client.
+std::optional<PubSubClient> mqttClient;
+PubSubClient &mqtt() {
+  if (!mqttClient) mqttClient.emplace(net);
+  return *mqttClient;
+}
+bool mqttConnected() { return mqttClient && mqttClient->connected(); }
 
 HaConfig config;
 HaStatus status;
@@ -229,7 +237,7 @@ void buildState(JsonDocument &doc) {
 }
 
 bool publishUpdate() {
-  if (!mqtt.connected()) return false;
+  if (!mqttConnected()) return false;
   ManagementUpdateStatus u;
   management_update_status(&u);
   JsonDocument doc;
@@ -243,22 +251,22 @@ bool publishUpdate() {
   doc["phase"] = u.phase;
   String payload;
   serializeJson(doc, payload);
-  const bool ok = mqtt.publish(updateTopic, payload.c_str(), true);
+  const bool ok = mqtt().publish(updateTopic, payload.c_str(), true);
   if (ok) status.published++;
   return ok;
 }
 
 bool publishState() {
-  if (!mqtt.connected()) return false;
+  if (!mqttConnected()) return false;
   JsonDocument doc;
   buildState(doc);
   String payload;
   serializeJson(doc, payload);
-  const bool ok = mqtt.publish(stateTopic, payload.c_str(), true);
+  const bool ok = mqtt().publish(stateTopic, payload.c_str(), true);
   if (ok) status.published++;
   payload = "";
   serializeJson(doc["light"], payload);
-  if (mqtt.publish(lightTopic, payload.c_str(), true)) status.published++;
+  if (mqtt().publish(lightTopic, payload.c_str(), true)) status.published++;
   publishUpdate();
   return ok;
 }
@@ -367,7 +375,7 @@ bool publishDiscovery(const char *component, const char *object, JsonDocument &d
            component, clientId, object);
   String payload;
   serializeJson(doc, payload);
-  const bool ok = mqtt.publish(topic, payload.c_str(), true);
+  const bool ok = mqtt().publish(topic, payload.c_str(), true);
   if (ok) status.published++;
   return ok;
 }
@@ -723,20 +731,23 @@ bool connectBroker() {
     return false;
   }
   status.state = HA_CONNECTING;
-  mqtt.setServer(config.host, config.port ? config.port : 1883);
-  mqtt.setBufferSize(MQTT_BUFFER);
-  mqtt.setKeepAlive(30);
-  mqtt.setCallback(onMessage);
+  mqtt().setServer(config.host, config.port ? config.port : 1883);
+  if (!mqtt().setBufferSize(MQTT_BUFFER)) {
+    setError(HA_FAILED, "Not enough memory for MQTT buffer");
+    return false;
+  }
+  mqtt().setKeepAlive(30);
+  mqtt().setCallback(onMessage);
 
   const bool ok =
       config.user[0]
-          ? mqtt.connect(clientId, config.user, config.password, availabilityTopic,
+          ? mqtt().connect(clientId, config.user, config.password, availabilityTopic,
                          0, true, "offline")
-          : mqtt.connect(clientId, availabilityTopic, 0, true, "offline");
+          : mqtt().connect(clientId, availabilityTopic, 0, true, "offline");
 
   if (!ok) {
-    setError(HA_FAILED, brokerError(mqtt.state()));
-    LOGF("[mqtt] %s (%d)\n", status.error, mqtt.state());
+    setError(HA_FAILED, brokerError(mqtt().state()));
+    LOGF("[mqtt] %s (%d)\n", status.error, mqtt().state());
     return false;
   }
 
@@ -746,12 +757,12 @@ bool connectBroker() {
   status.connects++;
   backoffMs = RECONNECT_MIN_MS;
 
-  mqtt.publish(availabilityTopic, "online", true);
+  mqtt().publish(availabilityTopic, "online", true);
   char wildcard[sizeof(commandRoot) + 4];
   snprintf(wildcard, sizeof(wildcard), "%s/#", commandRoot);
-  mqtt.subscribe(wildcard);
+  mqtt().subscribe(wildcard);
   const String birthTopic = String(config.discoveryPrefix) + "/status";
-  mqtt.subscribe(birthTopic.c_str());
+  mqtt().subscribe(birthTopic.c_str());
 
   discoveryCursor = 0;
   status.discoveryDone = false;
@@ -796,9 +807,9 @@ void ha_configure(const HaConfig &cfg) {
                      config.discovery != cfg.discovery ||
                      config.enabled != cfg.enabled;
 
-  if (moved && mqtt.connected()) {
-    mqtt.publish(availabilityTopic, "offline", true);
-    mqtt.disconnect();
+  if (moved && mqttConnected()) {
+    mqtt().publish(availabilityTopic, "offline", true);
+    mqtt().disconnect();
   }
   config = cfg;
   if (config.port == 0) config.port = 1883;
@@ -838,18 +849,18 @@ void ha_begin() {
 }
 
 void ha_loop() {
+  if (!started || !config.enabled) return;
   if (management_update_busy()) {
-    if (mqtt.connected()) {
+    if (mqttConnected()) {
       publishUpdate();
-      mqtt.publish(availabilityTopic, "offline", true);
-      mqtt.disconnect();
+      mqtt().publish(availabilityTopic, "offline", true);
+      mqtt().disconnect();
     }
     return;
   }
-  if (!started || !config.enabled) return;
   if (WiFi.status() != WL_CONNECTED) return;
 
-  if (!mqtt.connected()) {
+  if (!mqttConnected()) {
     const uint32_t now = millis();
     if ((int32_t)(now - nextAttemptMs) < 0) return;
     if (!connectBroker()) {
@@ -859,7 +870,7 @@ void ha_loop() {
     }
   }
 
-  mqtt.loop();
+  mqtt().loop();
   if (pendingUpdate >= 0) {
     const bool install = pendingUpdate == 1;
     pendingUpdate = -1;
@@ -884,7 +895,7 @@ void ha_loop() {
 }
 
 void ha_announce() {
-  if (!config.enabled || !mqtt.connected()) return;
+  if (!config.enabled || !mqttConnected()) return;
   discoveryCursor = 0;
   status.discoveryDone = false;
   lastPublishMs = 0;
@@ -892,7 +903,7 @@ void ha_announce() {
 
 void ha_publish_state() {
   if (management_update_busy()) return;
-  if (!config.enabled || !mqtt.connected()) return;
+  if (!config.enabled || !mqttConnected()) return;
   publishState();
   lastPublishMs = millis();
 }
