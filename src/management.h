@@ -135,7 +135,8 @@ void management_set_bt_active(bool active);
 bool management_media_action(const char *action, int value);
 
 /*
- * Writes the sound, announcement and Home Assistant settings to NVS.
+ * Schedules the sound, announcement and Home Assistant settings for NVS after
+ * 1.2 seconds without another change. An orderly reboot flushes pending saves.
  *
  * The same shape as management_store_leds() and there for the same reason: the
  * live objects are owned by audio_eq, voice and home_assistant, and the console
@@ -160,6 +161,18 @@ void management_store_audio();
  * waits for the worker to release its stream resources before opening TLS.
  */
 bool management_update_busy();
+
+struct ManagementUpdateStatus {
+  char phase[16];
+  char message[128];
+  char latestVersion[40];
+  char releaseUrl[192];
+  uint32_t done, total;
+  bool available, busy;
+};
+// Loop task only; uses the same signed release path as the dashboard.
+bool management_update_request(bool install);
+void management_update_status(ManagementUpdateStatus *out);
 
 /*
  * The announcement mapped to one Bluetooth address, or voice_clip_count() when
@@ -189,14 +202,18 @@ void management_df_defaults(uint8_t *source, uint8_t *volume, uint8_t *eq,
                            uint8_t *loop, uint8_t *loopFolder, bool *autoplay);
 
 /*
- * Writes the live WS2812 configuration to NVS.
+ * Schedules the live WS2812 configuration for NVS after 1.2 seconds without
+ * another change. An orderly reboot flushes pending saves.
  *
  * The dashboard does not need this -- it goes through /api/leds, which persists
- * on its own after the sliders stop moving. This is for the serial console,
+ * on its own after the sliders stop moving. This is for MQTT and the serial console,
  * which reaches leds_configure() directly and would otherwise be the one way to
  * change a setting that does not survive a reboot.
  */
 void management_store_leds();
+
+// Flush pending audio/lighting changes before the loop stops for standby.
+void management_flush_settings();
 
 // True when the network or update layer has something to show on the status LED
 // that outranks anything Bluetooth has to say, in which case *out is filled in.
@@ -218,7 +235,17 @@ inline void management_df_defaults(uint8_t *, uint8_t *, uint8_t *, uint8_t *,
 inline bool management_media_action(const char *, int) { return false; }
 inline void management_store_audio() {}
 inline bool management_update_busy() { return false; }
+inline bool management_update_request(bool) { return false; }
+struct ManagementUpdateStatus {
+  char phase[16], message[128], latestVersion[40], releaseUrl[192];
+  uint32_t done, total;
+  bool available, busy;
+};
+inline void management_update_status(ManagementUpdateStatus *out) {
+  if (out) *out = ManagementUpdateStatus{};
+}
 inline uint8_t management_voice_clip_for(const uint8_t *) { return 0xFF; }
 inline void management_store_leds() {}
+inline void management_flush_settings() {}
 inline bool management_led_state(StatusLedState *) { return false; }
 #endif

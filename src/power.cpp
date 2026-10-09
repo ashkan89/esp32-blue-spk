@@ -284,6 +284,7 @@ bool power_sleep_now() {
   g_sleeping = true;
 
   LOGF("[power] standby; wake on GPIO%d\n", (int)PIN_UI_BUTTON);
+  management_flush_settings();
   const uint32_t scheduledWake = product_wake_seconds();
 
   /*

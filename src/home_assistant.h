@@ -27,10 +27,12 @@
  *               the radio station (as a dropdown of the stored favourites), the
  *               LED ring as a light with colour and brightness, the sleep timer
  *               as a number of minutes, and one switch per configured alarm.
+ *               Also EQ bands/preamp, radio autostart/station step, ring speed,
+ *               music response/idle timeout, alarm snooze/dismiss and signed OTA.
  *   readings    what is playing and what it is called, the battery voltage,
  *               charge and charging state, the die temperature, free heap, Wi-Fi
  *               signal, uptime and total runtime.
- *   the switch  standby, as a switch that turns off and cannot turn back on --
+ *   the button  standby, which puts the speaker to sleep and cannot wake it --
  *               which is the honest shape for it, because a chip in deep sleep
  *               is not listening to MQTT and no amount of protocol will change
  *               that. The entity says so in its name.

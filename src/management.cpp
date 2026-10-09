@@ -292,6 +292,9 @@ bool ledsDirty;
 uint32_t ledsDirtyAt;
 constexpr uint32_t LEDS_PERSIST_QUIET_MS = 1200;
 void saveLedSettings();
+bool audioDirty;
+uint32_t audioDirtyAt;
+constexpr uint32_t AUDIO_PERSIST_QUIET_MS = 1200;
 
 /*
  * Reads a struct back out of NVS, or leaves the caller's defaults in place.
@@ -520,30 +523,53 @@ void saveSettings() {
   saveLedSettings();
 }
 
-/*
- * The ring's own keys, split out of saveSettings() because they are written on
- * a different schedule from everything else: a colour picker being dragged
- * produces a request per frame, and each one of those must not be a flash
- * write. See handleLeds() and the flush in management_loop().
- */
-void saveAudioSettings() {
-  prefs.putBytes("eq", &settings.eq, sizeof(settings.eq));
-  prefs.putBytes("voice", &settings.voice, sizeof(settings.voice));
-  prefs.putString("voiceDev", settings.voiceDevices);
-  prefs.putBytes("haCfg", &settings.ha, sizeof(settings.ha));
+// EQ sliders and MQTT commands apply immediately, but store only the final
+// configuration after a quiet interval. Restore and broker setup save at once.
+void saveAudioSettings(bool deferred = false) {
+  if (deferred) {
+    audioDirty = true;
+    audioDirtyAt = millis();
+    return;
+  }
+  bool saved = prefs.putBytes("eq", &settings.eq, sizeof(settings.eq)) == sizeof(settings.eq);
+  saved &= prefs.putBytes("voice", &settings.voice, sizeof(settings.voice)) == sizeof(settings.voice);
+  saved &= prefs.putString("voiceDev", settings.voiceDevices) == settings.voiceDevices.length();
+  saved &= prefs.putBytes("haCfg", &settings.ha, sizeof(settings.ha)) == sizeof(settings.ha);
+  saved &= prefs.putUChar("dfEq", settings.dfEq) == sizeof(settings.dfEq);
+  audioDirty = !saved;
+  // Retry a failed save after another quiet interval, never on every loop pass.
+  if (!saved) audioDirtyAt = millis();
 }
 
+// The ring has its own save schedule so colour-picker and MQTT bursts can
+// update the live configuration without writing every intermediate value.
 void saveLedSettings() {
-  prefs.putBool("ledOn", settings.leds.enabled);
-  prefs.putUChar("ledFx", settings.leds.effect);
-  prefs.putUChar("ledBri", settings.leds.brightness);
-  prefs.putUChar("ledSpd", settings.leds.speed);
-  prefs.putUChar("ledRct", settings.leds.reactivity);
-  prefs.putULong("ledCol", settings.leds.color);
-  prefs.putULong("ledCol2", settings.leds.color2);
-  prefs.putBool("ledIdle", settings.leds.idleOff);
-  prefs.putUShort("ledIdleS", settings.leds.idleAfterS);
-  ledsDirty = false;
+  bool saved = prefs.putBool("ledOn", settings.leds.enabled) == 1;
+  saved &= prefs.putUChar("ledFx", settings.leds.effect) == 1;
+  saved &= prefs.putUChar("ledBri", settings.leds.brightness) == 1;
+  saved &= prefs.putUChar("ledSpd", settings.leds.speed) == 1;
+  saved &= prefs.putUChar("ledRct", settings.leds.reactivity) == 1;
+  saved &= prefs.putULong("ledCol", settings.leds.color) == sizeof(uint32_t);
+  saved &= prefs.putULong("ledCol2", settings.leds.color2) == sizeof(uint32_t);
+  saved &= prefs.putBool("ledIdle", settings.leds.idleOff) == 1;
+  saved &= prefs.putUShort("ledIdleS", settings.leds.idleAfterS) == sizeof(uint16_t);
+  ledsDirty = !saved;
+  if (!saved) ledsDirtyAt = millis();
+}
+
+void serviceSettingsPersistence() {
+  const uint32_t now = millis();
+  if (ledsDirty && now - ledsDirtyAt >= LEDS_PERSIST_QUIET_MS) {
+    saveLedSettings();
+  }
+  if (audioDirty && now - audioDirtyAt >= AUDIO_PERSIST_QUIET_MS) {
+    saveAudioSettings();
+  }
+}
+
+void flushSettingsPersistence() {
+  if (ledsDirty) saveLedSettings();
+  if (audioDirty) saveAudioSettings();
 }
 
 /*
@@ -688,6 +714,8 @@ void rebootTask(void *arg) {
 
 void scheduleReboot(uint32_t delayMs) {
   if (rebootPending) return;
+  // The reset task can run before a deferred save's quiet interval expires.
+  flushSettingsPersistence();
   rebootPending = true;
   if (xTaskCreate(rebootTask, "reboot", 2048, (void *)(uintptr_t)delayMs,
                   configMAX_PRIORITIES - 2, nullptr) != pdPASS) {
@@ -3869,7 +3897,7 @@ void handleAudioSave() {
     }
   }
 
-  saveAudioSettings();
+  saveAudioSettings(true);
   ha_publish_state();
   handleAudioGet();
 }
@@ -4965,6 +4993,7 @@ void factoryReset() {
   // pairing behind, and "factory reset" has to mean it whichever mode you are
   // standing in. The caller reboots immediately; the partition reformats itself
   // on the next boot.
+  ledsDirty = audioDirty = false;
   prefs.end();
   const esp_err_t err = nvs_flash_erase();
   LOGF("[web] factory reset: settings cleared, nvs erase %s\n",
@@ -5259,6 +5288,21 @@ void management_set_bt_active(bool active) { btActive = active; }
 
 bool management_update_busy() { return githubJobActive.load() || updateSnapshot().busy; }
 
+bool management_update_request(bool install) { return startGithubJob(install); }
+
+void management_update_status(ManagementUpdateStatus *out) {
+  if (!out) return;
+  const UpdateState u = updateSnapshot();
+  strlcpy(out->phase, u.phase, sizeof(out->phase));
+  strlcpy(out->message, u.message, sizeof(out->message));
+  strlcpy(out->latestVersion, u.tag, sizeof(out->latestVersion));
+  strlcpy(out->releaseUrl, u.releaseUrl, sizeof(out->releaseUrl));
+  out->done = u.done;
+  out->total = u.total;
+  out->available = u.available;
+  out->busy = u.busy || githubJobActive.load();
+}
+
 bool management_media_action(const char *action, int value) {
   if (!action || !action[0]) return false;
   if (product_noise_control(action, value)) return true;
@@ -5317,19 +5361,27 @@ uint8_t management_voice_clip_for(const uint8_t *addr) {
 
 void management_store_audio() {
   audio_eq_get(&settings.eq);
+  if (df_player_running()) {
+    const uint8_t hw = audio_eq_hw_preset(settings.eq.enabled ? settings.eq.preset : EQ_PRESET_FLAT);
+    df_player_set_eq(hw);
+    if (hw != settings.dfEq) {
+      settings.dfEq = hw;
+    }
+  }
   voice_get(&settings.voice);
   ha_get(&settings.ha);
-  saveAudioSettings();
+  saveAudioSettings(true);
 }
 
 void management_store_leds() {
-  // Straight to flash rather than through the deferred path: this comes from a
-  // typed console command, so there is exactly one of them and no slider to
-  // debounce. Reading the live configuration back rather than trusting our own
-  // copy keeps the two in step whichever side made the change.
+  // Both console commands and MQTT use this path. MQTT can send a command for
+  // every slider step, so use the same quiet interval as the web controls.
   leds_get(&settings.leds);
-  saveLedSettings();
+  ledsDirty = true;
+  ledsDirtyAt = millis();
 }
+
+void management_flush_settings() { flushSettingsPersistence(); }
 
 void management_df_defaults(uint8_t *source, uint8_t *volume, uint8_t *eq,
                            uint8_t *loop, uint8_t *loopFolder, bool *autoplay) {
@@ -5565,9 +5617,7 @@ void management_loop() {
 
   // Before the mode check for the same reason the strike above is: the console
   // can change the lighting in a mode that has no dashboard at all.
-  if (ledsDirty && millis() - ledsDirtyAt >= LEDS_PERSIST_QUIET_MS) {
-    saveLedSettings();
-  }
+  serviceSettingsPersistence();
 
   if (!radio_mode_has_wifi(radioMode)) return;
 

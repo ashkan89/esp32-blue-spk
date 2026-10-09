@@ -13,6 +13,7 @@
 #include "df_player.h"
 #include "leds.h"
 #include "management.h"
+#include "mqtt_command.h"
 #include "net_radio.h"
 #include "player_state.h"
 #include "power.h"
@@ -24,11 +25,11 @@ namespace {
 
 /*
  * PubSubClient's buffer has to hold the largest single message, and the largest
- * here is a discovery document, not a state update. 1280 bytes covers the
+ * here is a discovery document or the combined state update. 2048 bytes covers the
  * biggest of them -- the radio station select, whose options list grows with
  * the favourites -- with room left for a long device name.
  */
-const uint16_t MQTT_BUFFER = 1280;
+const uint16_t MQTT_BUFFER = 2048;
 
 /// Reconnect backoff. A broker that is down is usually down for a while, and
 /// hammering it from a device that also has a radio stream to keep fed helps
@@ -65,7 +66,11 @@ uint8_t discoveryCursor;
 char clientId[40];
 char availabilityTopic[HA_TOPIC_MAX + 16];
 char stateTopic[HA_TOPIC_MAX + 16];
+char lightTopic[HA_TOPIC_MAX + 16];
+char updateTopic[HA_TOPIC_MAX + 16];
 char commandRoot[HA_TOPIC_MAX + 8];
+int8_t pendingUpdate = -1;
+bool announcePending;
 
 /// Remembered so the mute button has something to unmute to, exactly as the
 /// dashboard's does.
@@ -159,6 +164,14 @@ void buildState(JsonDocument &doc) {
   EqConfig eq;
   audio_eq_get(&eq);
   doc["eq"] = audio_eq_preset_name(eq.preset);
+  doc["eq_enabled"] = eq.enabled ? "ON" : "OFF";
+  doc["eq_auto_preamp"] = eq.autoPreamp ? "ON" : "OFF";
+  doc["eq_preamp"] = eq.preamp;
+  for (uint8_t i = 0; i < EQ_BANDS; ++i) {
+    char key[16];
+    snprintf(key, sizeof(key), "eq_band%u", (unsigned)(i + 1));
+    doc[key] = eq.gain[i];
+  }
 
   RadioStatus radio;
   net_radio_snapshot(&radio);
@@ -166,6 +179,7 @@ void buildState(JsonDocument &doc) {
   doc["radio_state"] = net_radio_state_name(radio.state);
   doc["radio_buffer"] = radio.bufferPercent;
   doc["radio_bitrate"] = radio.bitrate;
+  doc["radio_autostart"] = net_radio_autostart() ? "ON" : "OFF";
 
   TelemetrySample now;
   telemetry_now(&now);
@@ -199,6 +213,10 @@ void buildState(JsonDocument &doc) {
 
   LedConfig leds;
   leds_get(&leds);
+  doc["ring_speed"] = leds.speed;
+  doc["ring_reactivity"] = leds.reactivity;
+  doc["ring_idle_off"] = leds.idleOff ? "ON" : "OFF";
+  doc["ring_idle_seconds"] = leds.idleAfterS;
   JsonObject light = doc["light"].to<JsonObject>();
   light["state"] = leds.enabled && leds.effect != LED_FX_OFF ? "ON" : "OFF";
   light["brightness"] = leds.brightness;
@@ -207,6 +225,27 @@ void buildState(JsonDocument &doc) {
   color["g"] = (leds.color >> 8) & 0xFF;
   color["b"] = leds.color & 0xFF;
   light["effect"] = leds_effect_name(leds.effect);
+  light["color_mode"] = "rgb";
+}
+
+bool publishUpdate() {
+  if (!mqtt.connected()) return false;
+  ManagementUpdateStatus u;
+  management_update_status(&u);
+  JsonDocument doc;
+  doc["installed_version"] = FW_VERSION;
+  // An older release must not appear as an available HA update.
+  doc["latest_version"] = u.available && u.latestVersion[0] ? u.latestVersion : FW_VERSION;
+  doc["title"] = "Speaker firmware";
+  doc["release_url"] = u.releaseUrl;
+  doc["release_summary"] = u.message;
+  doc["in_progress"] = u.busy;
+  doc["phase"] = u.phase;
+  String payload;
+  serializeJson(doc, payload);
+  const bool ok = mqtt.publish(updateTopic, payload.c_str(), true);
+  if (ok) status.published++;
+  return ok;
 }
 
 bool publishState() {
@@ -217,6 +256,10 @@ bool publishState() {
   serializeJson(doc, payload);
   const bool ok = mqtt.publish(stateTopic, payload.c_str(), true);
   if (ok) status.published++;
+  payload = "";
+  serializeJson(doc["light"], payload);
+  if (mqtt.publish(lightTopic, payload.c_str(), true)) status.published++;
+  publishUpdate();
   return ok;
 }
 
@@ -261,6 +304,28 @@ const Entity ENTITIES[] = {
     {"binary_sensor", "playing", "Playing", "playing", "running", nullptr, nullptr, nullptr},
 
     // --- controls ---------------------------------------------------------
+    {"button", "play", "Play", nullptr, nullptr, nullptr, "mdi:play", "play"},
+    {"button", "pause", "Pause", nullptr, nullptr, nullptr, "mdi:pause", "pause"},
+    {"button", "stop", "Stop", nullptr, nullptr, nullptr, "mdi:stop", "stop"},
+    {"switch", "eq_enabled", "Equaliser enabled", "eq_enabled", nullptr, nullptr, "mdi:tune", "eq_enabled"},
+    {"switch", "eq_auto_preamp", "Automatic headroom", "eq_auto_preamp", nullptr, nullptr, "mdi:volume-minus", "eq_auto_preamp"},
+    {"number", "eq_preamp", "Preamp", "eq_preamp", nullptr, "dB", "mdi:volume-high", "eq_preamp"},
+    {"number", "eq_band1", "EQ 60 Hz", "eq_band1", nullptr, "dB", "mdi:tune", "eq_band1"},
+    {"number", "eq_band2", "EQ 250 Hz", "eq_band2", nullptr, "dB", "mdi:tune", "eq_band2"},
+    {"number", "eq_band3", "EQ 1 kHz", "eq_band3", nullptr, "dB", "mdi:tune", "eq_band3"},
+    {"number", "eq_band4", "EQ 4 kHz", "eq_band4", nullptr, "dB", "mdi:tune", "eq_band4"},
+    {"number", "eq_band5", "EQ 12 kHz", "eq_band5", nullptr, "dB", "mdi:tune", "eq_band5"},
+    {"button", "radio_next", "Next station", nullptr, nullptr, nullptr, "mdi:radio", "radio_next"},
+    {"button", "radio_previous", "Previous station", nullptr, nullptr, nullptr, "mdi:radio", "radio_previous"},
+    {"switch", "radio_autostart", "Radio autostart", "radio_autostart", nullptr, nullptr, "mdi:radio", "radio_autostart"},
+    {"number", "ring_speed", "Ring speed", "ring_speed", nullptr, nullptr, "mdi:speedometer", "ring_speed"},
+    {"number", "ring_reactivity", "Ring music response", "ring_reactivity", nullptr, "%", "mdi:music", "ring_reactivity"},
+    {"switch", "ring_idle_off", "Ring idle off", "ring_idle_off", nullptr, nullptr, "mdi:lightbulb-auto", "ring_idle_off"},
+    {"number", "ring_idle_seconds", "Ring idle timeout", "ring_idle_seconds", nullptr, "s", "mdi:timer", "ring_idle_seconds"},
+    {"button", "alarm_snooze", "Snooze alarm", nullptr, nullptr, nullptr, "mdi:alarm-snooze", "alarm_snooze"},
+    {"button", "alarm_dismiss", "Dismiss alarm", nullptr, nullptr, nullptr, "mdi:alarm-off", "alarm_dismiss"},
+    {"button", "update_check", "Check firmware", nullptr, nullptr, nullptr, "mdi:update", "update_check"},
+    {"sensor", "radio_bitrate", "Radio bitrate", "radio_bitrate", nullptr, "kbit/s", "mdi:radio", nullptr},
     {"number", "volume", "Volume", "volume", nullptr, "%", "mdi:volume-high", "volume"},
     {"switch", "mute", "Mute", "mute", nullptr, nullptr, "mdi:volume-off", "mute"},
     {"button", "play_pause", "Play / pause", nullptr, nullptr, nullptr, "mdi:play-pause", "toggle"},
@@ -279,8 +344,9 @@ const uint8_t ENTITY_COUNT = sizeof(ENTITIES) / sizeof(ENTITIES[0]);
 /// a shape the table cannot express: one is a different schema entirely, and the
 /// others depend on how many alarms exist.
 const uint8_t EXTRA_LIGHT = ENTITY_COUNT;
-const uint8_t EXTRA_ALARMS = ENTITY_COUNT + 1;
-uint8_t discoveryTotal() { return (uint8_t)(ENTITY_COUNT + 1 + alarm_count()); }
+const uint8_t EXTRA_UPDATE = ENTITY_COUNT + 1;
+const uint8_t EXTRA_ALARMS = ENTITY_COUNT + 2;
+uint8_t discoveryTotal() { return (uint8_t)(ENTITY_COUNT + 2 + alarm_count()); }
 
 /// The device block every entity carries, which is what makes Home Assistant
 /// group them under one card instead of scattering two dozen loose entities.
@@ -330,10 +396,21 @@ void discoverTableEntity(const Entity &e) {
   }
 
   if (strcmp(e.component, "number") == 0) {
+    // HA's number services can pass 50.0 for an integer slider.
+    doc["cmd_tpl"] = "{{ value | int }}";
     doc["min"] = 0;
     doc["max"] = strcmp(e.object, "sleep") == 0 ? 600 : 100;
     doc["step"] = strcmp(e.object, "sleep") == 0 ? 5 : 1;
     doc["mode"] = "slider";
+    if (strncmp(e.object, "eq_band", 7) == 0 || strcmp(e.object, "eq_preamp") == 0) {
+      doc["min"] = EQ_GAIN_MIN;
+      doc["max"] = strcmp(e.object, "eq_preamp") == 0 ? EQ_PREAMP_MAX : EQ_GAIN_MAX;
+    } else if (strcmp(e.object, "ring_speed") == 0) {
+      doc["max"] = 255;
+    } else if (strcmp(e.object, "ring_idle_seconds") == 0) {
+      doc["min"] = LED_IDLE_AFTER_S_MIN;
+      doc["max"] = LED_IDLE_AFTER_S_MAX;
+    }
   }
   if (strcmp(e.component, "button") == 0) doc["payload_press"] = "press";
 
@@ -360,8 +437,7 @@ void discoverLight() {
   doc["uniq_id"] = String(clientId) + "_ring";
   doc["avty_t"] = "~/status";
   doc["schema"] = "json";
-  doc["stat_t"] = "~/state";
-  doc["val_tpl"] = "{{ value_json.light | tojson }}";
+  doc["stat_t"] = "~/light/state";
   doc["cmd_t"] = "~/cmd/light";
   doc["brightness"] = true;
   JsonArray modes = doc["supported_color_modes"].to<JsonArray>();
@@ -371,6 +447,21 @@ void discoverLight() {
   for (uint8_t i = 0; i < LED_FX_COUNT; i++) effects.add(leds_effect_name(i));
   addDevice(doc.as<JsonObject>());
   publishDiscovery("light", "ring", doc);
+}
+
+void discoverUpdate() {
+  JsonDocument doc;
+  doc["~"] = config.baseTopic;
+  doc["name"] = "Firmware";
+  doc["uniq_id"] = String(clientId) + "_firmware";
+  doc["avty_t"] = "~/status";
+  doc["stat_t"] = "~/update/state";
+  doc["cmd_t"] = "~/cmd/update_install";
+  doc["payload_install"] = "INSTALL";
+  doc["dev_cla"] = "firmware";
+  doc["ent_cat"] = "config";
+  addDevice(doc.as<JsonObject>());
+  publishDiscovery("update", "firmware", doc);
 }
 
 void discoverAlarm(uint8_t index) {
@@ -409,6 +500,8 @@ bool serviceDiscovery() {
       discoverTableEntity(ENTITIES[discoveryCursor]);
     } else if (discoveryCursor == EXTRA_LIGHT) {
       discoverLight();
+    } else if (discoveryCursor == EXTRA_UPDATE) {
+      discoverUpdate();
     } else {
       discoverAlarm((uint8_t)(discoveryCursor - EXTRA_ALARMS));
     }
@@ -417,6 +510,8 @@ bool serviceDiscovery() {
     status.discoveryDone = true;
     LOGF("[mqtt] published %u discovery documents\n",
                   (unsigned)discoveryTotal());
+    publishState();
+    lastPublishMs = millis();
     return false;
   }
   return true;
@@ -424,66 +519,111 @@ bool serviceDiscovery() {
 
 // ------------------------------------------------------------- commands ----
 
-void applyLightCommand(const char *payload) {
+bool applyLightCommand(const char *payload) {
   JsonDocument doc;
-  if (deserializeJson(doc, payload)) return;
+  if (deserializeJson(doc, payload) || !doc.is<JsonObject>()) return false;
   LedConfig cfg;
   leds_get(&cfg);
 
   if (!doc["state"].isNull()) {
-    const bool on = strcmp(doc["state"] | "", "ON") == 0;
+    bool on;
+    if (!doc["state"].is<const char *>() || !mqtt_switch(doc["state"], &on)) return false;
     cfg.enabled = on;
     // Turning a Home Assistant light "on" when the stored effect is Off would
     // leave it dark and looking broken, so it lands on the plain solid colour.
     if (on && cfg.effect == LED_FX_OFF) cfg.effect = LED_FX_SOLID;
   }
-  if (!doc["brightness"].isNull()) cfg.brightness = doc["brightness"] | cfg.brightness;
+  if (!doc["brightness"].isNull()) {
+    if (!doc["brightness"].is<int>() || doc["brightness"].as<int>() < 0 ||
+        doc["brightness"].as<int>() > 255) return false;
+    cfg.brightness = doc["brightness"].as<int>();
+  }
   if (!doc["color"].isNull()) {
+    for (const char *key : {"r", "g", "b"}) {
+      JsonVariantConst value = doc["color"][key];
+      if (!value.is<int>() || value.as<int>() < 0 || value.as<int>() > 255) return false;
+    }
     const uint8_t r = doc["color"]["r"] | 0;
     const uint8_t g = doc["color"]["g"] | 0;
     const uint8_t b = doc["color"]["b"] | 0;
     cfg.color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
   }
   if (!doc["effect"].isNull()) {
+    if (!doc["effect"].is<const char *>()) return false;
     const char *want = doc["effect"] | "";
+    bool found = false;
     for (uint8_t i = 0; i < LED_FX_COUNT; i++) {
       if (strcasecmp(want, leds_effect_name(i)) == 0) {
         cfg.effect = i;
+        found = true;
         break;
       }
     }
+    if (!found) return false;
   }
   leds_configure(cfg);
   management_store_leds();
+  return true;
 }
 
 void onMessage(char *topic, uint8_t *payloadBytes, unsigned int length) {
   // PubSubClient hands over the payload without a terminator, and every command
   // here is short text.
-  char payload[128];
-  const unsigned int n = length < sizeof(payload) - 1 ? length : sizeof(payload) - 1;
-  memcpy(payload, payloadBytes, n);
-  payload[n] = 0;
+  char payload[512];
+  if (!length || length >= sizeof(payload) || memchr(payloadBytes, 0, length)) return;
+  memcpy(payload, payloadBytes, length);
+  payload[length] = 0;
 
-  const char *what = strrchr(topic, '/');
+  const String birthTopic = String(config.discoveryPrefix) + "/status";
+  if (strcmp(topic, birthTopic.c_str()) == 0) {
+    if (strcmp(payload, "online") == 0) announcePending = true;
+    return;
+  }
+
+  const char *what = mqtt_command_suffix(topic, commandRoot);
   if (!what) return;
-  what++;
-  status.received++;
+  int number;
+  bool on;
 
   if (strcmp(what, "volume") == 0) {
-    const int percent = constrain(atoi(payload), 0, 100);
+    if (!mqtt_integer(payload, 0, 100, &number)) return;
+    const int percent = number;
     const uint8_t value = (uint8_t)((percent * 127 + 50) / 100);
     if (value) mutedFrom = value;
     management_media_action("volume", value);
   } else if (strcmp(what, "mute") == 0) {
-    const bool on = strcmp(payload, "ON") == 0;
+    if (!mqtt_switch(payload, &on)) return;
+    if (on && currentVolume()) mutedFrom = currentVolume();
     management_media_action("volume", on ? 0 : (mutedFrom ? mutedFrom : 80));
   } else if (strcmp(what, "toggle") == 0 || strcmp(what, "next") == 0 ||
-             strcmp(what, "previous") == 0) {
+             strcmp(what, "previous") == 0 || strcmp(what, "play") == 0 ||
+             strcmp(what, "pause") == 0 || strcmp(what, "stop") == 0) {
+    if (strcmp(payload, "press") != 0) return;
     management_media_action(what, 0);
+  } else if (strcmp(what, "eq_enabled") == 0 || strcmp(what, "eq_auto_preamp") == 0 ||
+             strcmp(what, "eq_preamp") == 0 || strncmp(what, "eq_band", 7) == 0) {
+    EqConfig eq;
+    audio_eq_get(&eq);
+    if (strcmp(what, "eq_enabled") == 0 || strcmp(what, "eq_auto_preamp") == 0) {
+      if (!mqtt_switch(payload, &on)) return;
+      if (strcmp(what, "eq_enabled") == 0) eq.enabled = on;
+      else eq.autoPreamp = on;
+    } else if (strcmp(what, "eq_preamp") == 0) {
+      if (!mqtt_integer(payload, EQ_PREAMP_MIN, EQ_PREAMP_MAX, &number)) return;
+      eq.preamp = number;
+    } else {
+      int band;
+      if (!mqtt_integer(what + 7, 1, EQ_BANDS, &band) ||
+          !mqtt_integer(payload, EQ_GAIN_MIN, EQ_GAIN_MAX, &number)) return;
+      eq.gain[band - 1] = number;
+      eq.preset = EQ_PRESET_CUSTOM;
+    }
+    audio_eq_configure(eq);
+    management_store_audio();
   } else if (strcmp(what, "eq") == 0) {
     EqConfig eq;
     audio_eq_get(&eq);
+    bool found = false;
     for (uint8_t i = 0; i < EQ_PRESET_COUNT; i++) {
       if (strcasecmp(payload, audio_eq_preset_name(i)) == 0) {
         eq.preset = i;
@@ -491,9 +631,19 @@ void onMessage(char *topic, uint8_t *payloadBytes, unsigned int length) {
         audio_eq_preset_gains(i, eq.gain);
         audio_eq_configure(eq);
         management_store_audio();
+        found = true;
         break;
       }
     }
+    if (!found) return;
+  } else if (strcmp(what, "radio_next") == 0 || strcmp(what, "radio_previous") == 0) {
+    if (strcmp(payload, "press") != 0) return;
+    net_radio_step_station(strcmp(what, "radio_next") == 0);
+  } else if (strcmp(what, "radio_url") == 0) {
+    if (length >= RADIO_PLAY_URL_MAX || !net_radio_play_url(payload, "MQTT stream")) return;
+  } else if (strcmp(what, "radio_autostart") == 0) {
+    if (!mqtt_switch(payload, &on)) return;
+    net_radio_set_autostart(on);
   } else if (strcmp(what, "station") == 0) {
     if (strcasecmp(payload, "Stopped") == 0) {
       net_radio_stop();
@@ -507,24 +657,59 @@ void onMessage(char *topic, uint8_t *payloadBytes, unsigned int length) {
       }
     }
   } else if (strcmp(what, "sleep") == 0) {
-    const int minutes = constrain(atoi(payload), 0, 600);
+    if (!mqtt_integer(payload, 0, 600, &number)) return;
+    const int minutes = number;
     if (minutes) alarm_sleep_start((uint16_t)minutes, alarm_sleep_standby_default());
     else alarm_sleep_cancel();
   } else if (strcmp(what, "standby") == 0) {
+    if (strcmp(payload, "press") != 0) return;
     if (power_sleep_possible()) power_sleep_now();
   } else if (strcmp(what, "light") == 0) {
-    applyLightCommand(payload);
+    if (!applyLightCommand(payload)) return;
+  } else if (strncmp(what, "ring_", 5) == 0) {
+    LedConfig cfg;
+    leds_get(&cfg);
+    if (strcmp(what, "ring_idle_off") == 0) {
+      if (!mqtt_switch(payload, &on)) return;
+      cfg.idleOff = on;
+    } else if (strcmp(what, "ring_speed") == 0) {
+      if (!mqtt_integer(payload, 0, 255, &number)) return;
+      cfg.speed = number;
+    } else if (strcmp(what, "ring_reactivity") == 0) {
+      if (!mqtt_integer(payload, 0, 100, &number)) return;
+      cfg.reactivity = number;
+    } else if (strcmp(what, "ring_idle_seconds") == 0) {
+      if (!mqtt_integer(payload, LED_IDLE_AFTER_S_MIN, LED_IDLE_AFTER_S_MAX, &number)) return;
+      cfg.idleAfterS = number;
+    } else return;
+    leds_configure(cfg);
+    management_store_leds();
+  } else if (strcmp(what, "alarm_snooze") == 0 || strcmp(what, "alarm_dismiss") == 0) {
+    if (strcmp(payload, "press") != 0) return;
+    if (strcmp(what, "alarm_snooze") == 0) alarm_snooze();
+    else alarm_dismiss();
+  } else if (strcmp(what, "alarm_trigger") == 0) {
+    if (!alarm_count() || !mqtt_integer(payload, 1, alarm_count(), &number)) return;
+    if (!alarm_trigger(number - 1)) return;
+  } else if (strcmp(what, "update_check") == 0 || strcmp(what, "update_install") == 0) {
+    const bool install = strcmp(what, "update_install") == 0;
+    if (strcmp(payload, install ? "INSTALL" : "press") != 0) return;
+    // startGithubJob calls ha_loop to release MQTT before TLS. Defer it until
+    // PubSubClient has finished using its callback buffer.
+    pendingUpdate = install ? 1 : 0;
   } else if (strncmp(what, "alarm", 5) == 0) {
-    const int which = atoi(what + 5);
+    if (!alarm_count() || !mqtt_integer(what + 5, 1, alarm_count(), &number) ||
+        !mqtt_switch(payload, &on)) return;
+    const int which = number;
     Alarm a;
     if (which >= 1 && alarm_get((uint8_t)(which - 1), &a)) {
-      a.enabled = strcmp(payload, "ON") == 0;
+      a.enabled = on;
       alarm_set((uint8_t)(which - 1), a);
     }
   } else {
-    status.received--;  // not ours after all
     return;
   }
+  status.received++;
 
   // Home Assistant's optimistic update is replaced by the real one immediately,
   // so a command the speaker could not honour -- a radio station in Bluetooth
@@ -565,6 +750,8 @@ bool connectBroker() {
   char wildcard[sizeof(commandRoot) + 4];
   snprintf(wildcard, sizeof(wildcard), "%s/#", commandRoot);
   mqtt.subscribe(wildcard);
+  const String birthTopic = String(config.discoveryPrefix) + "/status";
+  mqtt.subscribe(birthTopic.c_str());
 
   discoveryCursor = 0;
   status.discoveryDone = false;
@@ -581,6 +768,8 @@ void buildTopics() {
   snprintf(clientId, sizeof(clientId), "%s_%06lX", slug, (unsigned long)id);
   snprintf(availabilityTopic, sizeof(availabilityTopic), "%s/status", slug);
   snprintf(stateTopic, sizeof(stateTopic), "%s/state", slug);
+  snprintf(lightTopic, sizeof(lightTopic), "%s/light/state", slug);
+  snprintf(updateTopic, sizeof(updateTopic), "%s/update/state", slug);
   snprintf(commandRoot, sizeof(commandRoot), "%s/cmd", slug);
 }
 
@@ -603,8 +792,14 @@ void ha_configure(const HaConfig &cfg) {
                      strcmp(config.user, cfg.user) != 0 ||
                      strcmp(config.password, cfg.password) != 0 ||
                      strcmp(config.baseTopic, cfg.baseTopic) != 0 ||
+                     strcmp(config.discoveryPrefix, cfg.discoveryPrefix) != 0 ||
+                     config.discovery != cfg.discovery ||
                      config.enabled != cfg.enabled;
 
+  if (moved && mqtt.connected()) {
+    mqtt.publish(availabilityTopic, "offline", true);
+    mqtt.disconnect();
+  }
   config = cfg;
   if (config.port == 0) config.port = 1883;
   if (config.publishSeconds < 5) config.publishSeconds = 5;
@@ -614,10 +809,6 @@ void ha_configure(const HaConfig &cfg) {
   }
   buildTopics();
 
-  if (moved && mqtt.connected()) {
-    mqtt.publish(availabilityTopic, "offline", true);
-    mqtt.disconnect();
-  }
   if (!config.enabled) {
     status.state = HA_OFF;
     status.error[0] = 0;
@@ -648,7 +839,11 @@ void ha_begin() {
 
 void ha_loop() {
   if (management_update_busy()) {
-    if (mqtt.connected()) mqtt.disconnect();
+    if (mqtt.connected()) {
+      publishUpdate();
+      mqtt.publish(availabilityTopic, "offline", true);
+      mqtt.disconnect();
+    }
     return;
   }
   if (!started || !config.enabled) return;
@@ -665,6 +860,17 @@ void ha_loop() {
   }
 
   mqtt.loop();
+  if (pendingUpdate >= 0) {
+    const bool install = pendingUpdate == 1;
+    pendingUpdate = -1;
+    management_update_request(install);
+    if (management_update_busy()) return;
+    publishState();
+  }
+  if (announcePending) {
+    announcePending = false;
+    ha_announce();
+  }
 
   // Discovery first, and nothing else while it runs: an entity's state is
   // meaningless to Home Assistant until the entity exists.

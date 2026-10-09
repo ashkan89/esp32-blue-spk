@@ -3831,7 +3831,7 @@ What the whole bundle adds, measured from the linked image:
 
 Everything else is claimed when it is used and given back afterwards: the radio's
 22 kB arena and ~30 kB decoder while a stream runs, the 10 kB decoder task from
-the first station played, MQTT's 1.3 kB buffer while the broker is connected.
+the first station played, MQTT's 2 kB buffer while the broker is connected.
 
 Three rules came out of getting this wrong the first time, and they are worth
 keeping if you extend it:
@@ -3874,8 +3874,72 @@ one device and these entities:
 
 | Kind | Entities |
 |------|----------|
-| Controls | volume, mute, play/pause, next, previous, equaliser preset, radio station, the LED ring as a light with colour and effects, the sleep timer, one switch per alarm, standby |
-| Readings | source, now playing, connected device, battery, voltage, charging, chip temperature, free memory, Wi-Fi signal, uptime, total runtime, radio status and buffer level |
+| Sound | volume, mute, play, pause, stop, toggle, next/previous track, EQ preset and bypass, five EQ bands, preamp and automatic headroom |
+| Radio | favourite station select, next/previous station, autostart switch; direct stream URLs over MQTT |
+| Ring | light with RGB colour, brightness and effects; speed, music response, idle off and idle timeout |
+| Alarms | sleep timer, one enable switch per alarm, snooze and dismiss; trigger a configured alarm over MQTT |
+| Firmware | check firmware button and firmware update entity with installed/latest versions and install action |
+| Readings | source, now playing, connected device, battery, voltage, charging, chip temperature, free memory, Wi-Fi signal, uptime, total runtime, radio status, buffer level and bitrate |
+| Power | standby button (cannot wake over MQTT) |
+
+Discovery is retained and sent again when Home Assistant publishes `online` to
+`<discoveryPrefix>/status`. The default birth topic is `homeassistant/status`.
+The ring publishes JSON light state on `<baseTopic>/light/state`, firmware on
+`<baseTopic>/update/state`, and the other readings on `<baseTopic>/state`.
+
+Publish commands to `<baseTopic>/cmd/<command>` without retaining them. The
+base topic is shown on the dashboard's Home Assistant page. All names and
+payloads below are case sensitive except preset, effect and `Stopped` names.
+
+| Command | Payload |
+|---------|---------|
+| `volume` / `mute` | integer 0–100 / `ON` or `OFF` |
+| `play`, `pause`, `stop`, `toggle`, `next`, `previous` | `press` |
+| `eq` | preset name from the Sound page |
+| `eq_enabled`, `eq_auto_preamp` | `ON` or `OFF` |
+| `eq_band1` … `eq_band5` | integer −12…12 dB, for 60 Hz, 250 Hz, 1 kHz, 4 kHz and 12 kHz |
+| `eq_preamp` | integer −12…6 dB |
+| `station` | saved station name, or `Stopped` |
+| `radio_next`, `radio_previous` | `press` |
+| `radio_url` | `http://` or `https://` stream URL, fewer than 300 bytes |
+| `radio_autostart` | `ON` or `OFF` |
+| `light` | JSON, e.g. `{"state":"ON","brightness":100,"color":{"r":255,"g":80,"b":0},"effect":"Solid"}` |
+| `ring_speed` / `ring_reactivity` | integer 0–255 / 0–100 |
+| `ring_idle_off` / `ring_idle_seconds` | `ON` or `OFF` / integer 10–43200 seconds |
+| `alarm1` … `alarmN` | `ON` or `OFF` for a configured alarm |
+| `alarm_snooze`, `alarm_dismiss` | `press` |
+| `alarm_trigger` | configured alarm number, starting at 1 |
+| `sleep` | integer 0–600 minutes; 0 cancels |
+| `standby` | `press` |
+| `update_check` / `update_install` | `press` / `INSTALL` |
+
+EQ, ring and radio autostart changes persist across restarts. In DFPlayer mode,
+EQ presets/bypass control the module's hardware EQ; individual bands and preamp
+are stored for the PCM audio modes because the DFPlayer cannot apply them.
+
+To use OTA, configure the GitHub repository and board-specific signed `.spk`
+asset pattern on the dashboard's Settings page. Home Assistant's Firmware
+entity uses the [MQTT Update schema](https://www.home-assistant.io/integrations/update.mqtt/).
+Its install action calls the same updater as the dashboard: signatures, board
+compatibility and newer-version checks still apply. Checks and installs stop
+audio and temporarily disconnect MQTT to make room for TLS. The firmware state
+is published before disconnecting, then availability becomes `offline`; the
+speaker republishes the result when it reconnects, or the installed version
+after a successful update and reboot. Live download progress is available on
+the dashboard while MQTT is disconnected.
+
+For example, with a base topic of `speaker`:
+
+```sh
+mosquitto_pub -h BROKER -t speaker/cmd/eq_band1 -m 6
+mosquitto_pub -h BROKER -t speaker/cmd/ring_reactivity -m 80
+mosquitto_pub -h BROKER -t speaker/cmd/update_check -m press
+mosquitto_pub -h BROKER -t speaker/cmd/update_install -m INSTALL
+```
+
+Command validation and deferred OTA behavior can be tested without hardware:
+`python scripts/test_mqtt_commands.py` after a PlatformIO build (uses the
+development `ziglang` package and PlatformIO's ArduinoJson headers).
 
 Discovery is what makes that work. Home Assistant will happily talk to a device
 publishing to hand-written topics, provided somebody writes about eighty lines of
@@ -3884,7 +3948,7 @@ twice. Publishing the discovery documents means the entity list follows the
 firmware instead: add a radio station and the dropdown has one more option the
 next time the speaker connects.
 
-The standby switch turns off and cannot turn back on. That is the honest shape
+The standby button puts the speaker to sleep and cannot wake it. That is the honest shape
 for it — a chip in deep sleep is not listening to MQTT, and no amount of protocol
 will change that — and the entity's own name says so.
 
