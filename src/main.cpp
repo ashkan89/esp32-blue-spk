@@ -727,10 +727,8 @@ void on_peer_name(char *name) { ps_set_peer_name(name); }
 
 void on_sample_rate(uint16_t rate) { ps_set_sample_rate(rate); }
 
-/// Chooses the resting blink pattern. The network and update layer gets first
-/// refusal -- an access point waiting to be configured or an OTA write in
-/// progress matters more than what Bluetooth is doing -- and Bluetooth fills in
-/// the rest. status_led_tick() does the actual blinking, off millis().
+/// Management selects battery, update, network-stream and network setup states.
+/// Otherwise show the local source. status_led_tick() drives the chosen pattern.
 static void update_status_led() {
   StatusLedState state;
   if (!management_led_state(&state)) {
@@ -762,11 +760,11 @@ static void update_status_led() {
       // purpose, and the fault pattern is for things that went wrong.
       else if (d.asleep) state = LED_IDLE;
       else if (!d.online) state = LED_FAULT;
-      else if (d.busy) state = LED_BT_STREAMING;
       else if (d.pcLink) state = LED_NO_MEDIA;
       else if (d.source == DF_SRC_SD && !d.sdPresent) state = LED_NO_MEDIA;
       else if (d.source == DF_SRC_USB && !d.usbPresent) state = LED_NO_MEDIA;
-      else if (d.state == DF_PAUSED) state = LED_BT_CONNECTED;
+      else if (d.state == DF_PAUSED) state = LED_PAUSED;
+      else if (d.busy) state = LED_BT_STREAMING;
       else state = LED_IDLE;
     } else if (!bt_started) {
       state = LED_BOOT;

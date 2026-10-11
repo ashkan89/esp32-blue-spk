@@ -1960,12 +1960,17 @@ pattern repeats every two seconds:
 | Pattern | Meaning |
 |---------|---------|
 | solid | booting, or audio is streaming |
-| almost solid, one short wink | a phone is connected but not playing |
+| almost solid, a short wink each second | a phone is connected but not playing |
+| one long flash | DFPlayer or time-shift playback is paused |
+| four short flashes | opening an internet radio or UPnP stream |
+| two long flashes | buffering audio before playback, or after an underrun |
+| short flash then a long one | retrying a dropped stream |
+| five short flashes | the radio or UPnP stream is unavailable |
 | one short flash | up and waiting — discoverable, or Wi-Fi connected and idle |
 | even 500 ms blink | joining the saved Wi-Fi network |
 | three quick blinks, then dark | the setup hotspot is open and waiting for you |
 | fast strobe | writing flash — do not remove power |
-| two double blinks | an update failed |
+| two double blinks | an update failed, or the DFPlayer is offline |
 | two slow winks | the source has nothing to play from — no card, or the card is mounted on a computer |
 | long flash then a short one | the battery is below the critical threshold |
 
@@ -1975,9 +1980,17 @@ to cut out is the one fact that matters more than what is playing. It is
 suppressed while the charger says it is charging, so a speaker being fixed stops
 shouting about it.
 
+Radio and UPnP use the same playback patterns in both Wi-Fi and DFPlayer profiles.
+Solid means playing for Bluetooth, DFPlayer, radio and UPnP alike. A stopped
+stream returns to the local-source or network-ready pattern. An old stream error
+does not hide a DFPlayer that has resumed playback. State changes start a fresh
+pattern immediately, including after a timed LED wakes up.
+
 Events are shown as a short burst of fast blinks over whatever pattern is
 running: two on a phone connecting or a Wi-Fi client joining, three on a
-disconnect, one on a track change. Override `PIN_STATUS_LED` or
+disconnect, one on a track change. These bursts cannot cover a firmware write,
+fault or critical battery warning. The dashboard's indicator card also names
+the current state. Override `PIN_STATUS_LED` or
 `STATUS_LED_ACTIVE_HIGH` from `build_flags` for boards that wire it differently.
 
 **Settings → Power → Indicator LED** decides whether any of that is shown. Three
@@ -1986,8 +1999,8 @@ on** (the default), and **Timed** (lit for a while after something happens, then
 dark until the next event). An event is a change of pattern, a phone connecting,
 a track change, the BOOT button, or anything done on the dashboard — the same
 definition standby counts down from — and the timeout runs from ten seconds to
-twelve hours. Two patterns ignore the timeout because they must not go quiet:
-*writing flash* and *update failed*. Nothing ignores **Off**.
+twelve hours. Three patterns ignore the timeout because they must not go quiet:
+*writing flash*, *fault* and *critical battery*. Nothing ignores **Off**.
 
 Power saving sits above all of this. Whenever saving is on — chosen outright,
 engaged by the battery falling to the threshold, or on the way into standby —

@@ -15,6 +15,11 @@ const uint16_t PATTERNS[LED_STATE_COUNT] = {
     0b1010001010000000,  // LED_FAULT
     0b1100110000000000,  // LED_NO_MEDIA
     0b1111100010000000,  // LED_BATTERY_LOW
+    0b1010101000000000,  // LED_STREAM_CONNECTING
+    0b1110011100000000,  // LED_BUFFERING
+    0b1001110000000000,  // LED_RECONNECTING
+    0b1111000000000000,  // LED_PAUSED
+    0b1010101010000000,  // LED_STREAM_ERROR
 };
 
 constexpr uint32_t SLOT_MS = 125;
@@ -32,10 +37,10 @@ volatile uint32_t afterMs = (uint32_t)STATUS_LED_AFTER_S_DEFAULT * 1000UL;
 volatile uint32_t lastEventAt;
 volatile bool resting;
 
-/// Patterns that must outlast the timeout. Neither outlasts the mute or
+/// Patterns that must outlast the timeout. None outlasts the mute or
 /// STATUS_LED_MODE_OFF; see the header.
 bool urgent(uint8_t state) {
-  return state == LED_UPDATING || state == LED_FAULT;
+  return state == LED_UPDATING || state == LED_FAULT || state == LED_BATTERY_LOW;
 }
 
 /*
@@ -59,6 +64,8 @@ uint8_t blipSlots;  // remaining half-cycles of the attention blink
 uint32_t lastSlotAt;
 uint8_t slot;
 int8_t lastLevel = -1;
+uint8_t renderedState = LED_STATE_COUNT;
+bool restartPattern = true;
 
 void drive(bool on) {
   const int8_t level = on ? 1 : 0;
@@ -76,6 +83,9 @@ void status_led_begin(uint8_t pin, bool active_high) {
   pinMode(ledPin, OUTPUT);
   drive(false);
   lastSlotAt = millis();
+  lastEventAt = lastSlotAt;
+  renderedState = LED_STATE_COUNT;
+  restartPattern = true;
 }
 
 void status_led_state(StatusLedState state) {
@@ -88,15 +98,26 @@ void status_led_state(StatusLedState state) {
 
 StatusLedState status_led_state() { return (StatusLedState)baseState; }
 
+const char *status_led_state_name() {
+  static const char *const names[LED_STATE_COUNT] = {
+      "Booting", "Setup hotspot", "Joining Wi-Fi", "Idle", "Bluetooth connected",
+      "Playing", "Updating firmware", "Fault", "No media", "Critical battery",
+      "Opening stream", "Buffering", "Retrying stream", "Paused", "Stream unavailable"};
+  return names[baseState];
+}
+
 void status_led_blip(uint8_t pulses) {
   if (!pulses) return;
+  // An event while dark can refresh activity, but its flashes must not be
+  // replayed after the owner re-enables the indicator.
+  lastEventAt = millis();
+  if (muted || ledMode == STATUS_LED_MODE_OFF) return;
   if (pulses > 6) pulses = 6;
   // Two half-cycles per pulse: on, off.
   const uint8_t slots = (uint8_t)(pulses * 2);
   portENTER_CRITICAL(&blip_mux);
   if (slots > blipSlots) blipSlots = slots;
   portEXIT_CRITICAL(&blip_mux);
-  lastEventAt = millis();
 }
 
 void status_led_mute(bool on) {
@@ -136,17 +157,26 @@ void status_led_tick() {
   if (muted || ledMode == STATUS_LED_MODE_OFF) {
     resting = false;
     drive(false);
+    restartPattern = true;
+    portENTER_CRITICAL(&blip_mux);
+    blipSlots = 0;
+    portEXIT_CRITICAL(&blip_mux);
     return;
   }
 
   const uint32_t now = millis();
+  const uint8_t state = baseState;
+  if (state != renderedState) {
+    renderedState = state;
+    restartPattern = true;
+  }
 
   /*
    * The timeout, before the blip: a blip refreshes lastEventAt when it is
    * raised, so it can never arrive with the timer already expired, and the
    * check is therefore one comparison rather than a special case.
    */
-  if (ledMode == STATUS_LED_MODE_TIMEOUT && !urgent(baseState) &&
+  if (ledMode == STATUS_LED_MODE_TIMEOUT && !urgent(state) &&
       (now - lastEventAt) >= afterMs) {
     if (!resting) {
       resting = true;
@@ -165,13 +195,20 @@ void status_led_tick() {
     // whole cycle rather than the tail of one, and do not try to catch up on
     // the slots that were skipped while resting. Parked one slot behind so the
     // first bit is drawn now rather than 125 ms from now.
+    restartPattern = true;
+  }
+
+  if (restartPattern) {
     slot = 15;
     lastSlotAt = now - SLOT_MS;
+    restartPattern = false;
   }
 
   // Read and decrement in one critical section, so a blip raised from a radio
   // callback between the two cannot be overwritten by the store.
   portENTER_CRITICAL(&blip_mux);
+  // Attention flashes must never conceal a flash write, fault or low cell.
+  if (urgent(state)) blipSlots = 0;
   const uint8_t pending = blipSlots;
   const bool due = pending != 0 && (now - lastSlotAt) >= BLIP_MS;
   if (due) blipSlots = (uint8_t)(pending - 1);
@@ -184,7 +221,7 @@ void status_led_tick() {
     // An odd count left means "on", so a blip always ends dark and the resting
     // pattern picks up from a known state.
     drive((left & 1) != 0);
-    if (!left) slot = 0;
+    if (!left) restartPattern = true;
     return;
   }
 
@@ -194,6 +231,6 @@ void status_led_tick() {
   lastSlotAt += missed * SLOT_MS;
   slot = (uint8_t)((slot + missed) & 0x0F);
 
-  const uint16_t pattern = PATTERNS[baseState];
+  const uint16_t pattern = PATTERNS[state];
   drive((pattern >> (15 - slot)) & 1);
 }

@@ -8,7 +8,7 @@
  * Everything is expressed as a 16-slot pattern clocked at 125 ms, so one full
  * cycle is two seconds and every state is distinguishable across the room
  * without counting milliseconds. Patterns are chosen so that "more light" means
- * "more settled": solid when a phone is streaming, a lone flash when the
+ * "more settled": solid when any source is streaming, a lone flash when the
  * speaker is idle and waiting, restless blinking when the speaker needs
  * something from you.
  *
@@ -38,6 +38,11 @@ enum StatusLedState : uint8_t {
   LED_FAULT,           // urgent double-double blink: something failed
   LED_NO_MEDIA,        // two slow winks: the source has nothing to play from
   LED_BATTERY_LOW,     // long-short heartbeat: charge it
+  LED_STREAM_CONNECTING, // four short flashes: opening a radio / UPnP stream
+  LED_BUFFERING,       // two long flashes: waiting for audio data
+  LED_RECONNECTING,    // short-long flash: retrying a dropped stream
+  LED_PAUSED,          // one long flash: playback paused
+  LED_STREAM_ERROR,    // five short flashes: stream unavailable
   LED_STATE_COUNT
 };
 
@@ -48,9 +53,10 @@ void status_led_begin(uint8_t pin, bool active_high);
 // Sets the resting pattern. Cheap enough to call every loop.
 void status_led_state(StatusLedState state);
 StatusLedState status_led_state();
+const char *status_led_state_name();
 
-// Holds the indicator dark whatever pattern or mode is set, and lets it resume
-// where it was on release. Power saving and standby use it; nothing else should,
+// Holds the indicator dark whatever pattern or mode is set, and restarts the
+// current pattern on release. Power saving and standby use it; nothing else should,
 // because a status LED that is off is a speaker with no status on it. Release
 // counts as an event, so a timed indicator shows the state it came back to.
 void status_led_mute(bool on);
@@ -66,10 +72,11 @@ bool status_led_muted();
  * indicator goes dark, and the next event lights it again. A solid LED for the
  * three hours a phone streams is exactly what the mode is for suppressing.
  *
- * Two patterns ignore the timeout: LED_UPDATING, because "do not remove power"
+ * Three patterns ignore the timeout: LED_UPDATING, because "do not remove power"
  * is a message that must not time out while flash is being written, and
- * LED_FAULT, because a failure that has gone quiet is a failure nobody finds.
- * Neither ignores the mute or STATUS_LED_MODE_OFF: the owner said dark.
+ * LED_FAULT, because a failure that has gone quiet is a failure nobody finds,
+ * and LED_BATTERY_LOW, because a critical cell still needs attention.
+ * None ignores the mute or STATUS_LED_MODE_OFF: the owner said dark.
  */
 enum StatusLedMode : uint8_t {
   STATUS_LED_MODE_OFF = 0,  ///< never lit

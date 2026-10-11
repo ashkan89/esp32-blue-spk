@@ -2555,6 +2555,7 @@ void handleSettingsGet() {
   // leaving the owner to wonder whether the setting took.
   pwr["indicatorMuted"] = status_led_muted();
   pwr["indicatorResting"] = status_led_resting();
+  pwr["indicatorState"] = status_led_state_name();
 
   JsonObject df = doc["dfplayer"].to<JsonObject>();
   df["source"] = settings.dfSource;
@@ -5427,6 +5428,24 @@ bool management_led_state(StatusLedState *out) {
     *out = LED_FAULT;
     return true;
   }
+  // Radio and UPnP share the same decoder. Show its state before falling back
+  // to the DFPlayer or network readiness; never infer playback from Bluetooth
+  // startup in a profile that deliberately releases Bluetooth.
+  if (net_radio_running() &&
+      !(radioMode == RADIO_MODE_DFPLAYER && df_player_active() && !net_radio_owns_dac())) {
+    RadioStatus r;
+    net_radio_snapshot(&r);
+    switch (r.state) {
+      case RADIO_CONNECTING: *out = LED_STREAM_CONNECTING; return true;
+      case RADIO_BUFFERING: *out = LED_BUFFERING; return true;
+      case RADIO_RECONNECTING: *out = LED_RECONNECTING; return true;
+      case RADIO_PLAYING:
+        *out = time_shift_paused() ? LED_PAUSED : LED_BT_STREAMING;
+        return true;
+      case RADIO_ERROR: *out = LED_STREAM_ERROR; return true;
+      default: break;
+    }
+  }
   // In DFPlayer mode the speaker plays audio *and* runs Wi-Fi, so the network
   // only gets the LED while it is still finding its feet. Once the station is
   // home, what the speaker is doing is playing: decline here and let main.cpp
@@ -5440,8 +5459,7 @@ bool management_led_state(StatusLedState *out) {
     *out = LED_WIFI_CONNECTING;
     return true;
   }
-  // In Wi-Fi mode the LED is entirely the network's to talk about: Bluetooth
-  // has nothing to say because it is not running.
+  // With no active stream, show network readiness rather than Bluetooth boot.
   if (apRunning && WiFi.status() != WL_CONNECTED) {
     *out = LED_SETUP_AP;
     return true;
