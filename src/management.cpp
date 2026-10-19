@@ -1739,6 +1739,13 @@ void handleStatus() {
     df["dac"] = d.dacOn;
     df["version"] = d.version;
     df["finished"] = d.finished;
+    df["framesSent"] = d.framesSent;
+    df["framesGood"] = d.framesGood;
+    df["framesBad"] = d.framesBad;
+    df["errors"] = d.errors;
+    df["offlineEvents"] = d.offlineEvents;
+    df["lastErrorCode"] = d.lastErrorCode;
+    df["lastCommand"] = d.lastCommand;
     df["error"] = d.error;
     df["led"] = (int)d.ledMode;
     df["ledOn"] = d.ledOn;

@@ -161,6 +161,8 @@ struct DfStatus {
   uint32_t framesBad;      ///< ten-byte windows rejected by frameValid()
   uint32_t errors;         ///< 0x40 error notifications it sent us
   uint16_t offlineEvents;  ///< times the online timeout expired this boot
+  uint16_t lastErrorCode;  ///< raw 0x40 parameter, including clone-specific codes
+  uint8_t lastCommand;     ///< last command sent (errors do not identify it)
 };
 
 #if DFPLAYER_ENABLED
@@ -312,6 +314,8 @@ const char *df_eq_name(uint8_t eq);
 /// "df prev", "df vol 0-30", "df folder F T", "df source sd|usb|flash",
 /// "df eq 0-5", "df loop off|track|folder|all|random", "df reset", "df io1",
 /// "df io2", "df key1", "df key2", "df led auto|on|off|blink".
+/// Development diagnostics: "df polling off|on" and
+/// "df raw COMMAND_HEX [PARAMETER_HEX]" (for example "df raw 47").
 /// Returns false if the line was not one of those.
 bool df_player_command(const char *line);
 

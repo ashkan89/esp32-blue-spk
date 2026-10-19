@@ -33,13 +33,9 @@
  * they all *send* a correct one, so it is verified on the way in and always
  * sent on the way out.
  *
- * ACK is requested on nothing. It sounds like the safe choice and is not: the
- * module answers an acknowledged command with 0x41 before it acts on it, so a
- * queue of acknowledged commands interleaves replies with the asynchronous
- * notifications the module also sends, and the parser can no longer tell which
- * 0x42 belongs to which query. The status poll a moment later is a better
- * confirmation than the ACK anyway, because it reports what actually happened
- * rather than that a frame was received.
+ * Control commands request ACK, matching the established DFPlayer drivers.
+ * Queries already have their own typed replies. An ACK is only receipt, never
+ * proof of playback: 0x41 is parsed independently of status and media replies.
  */
 
 namespace {
@@ -152,6 +148,10 @@ volatile uint8_t activeSource = DF_SRC_SD;
  * the honest behaviour, because a module in standby has nothing to report.
  */
 volatile bool sleeping;
+volatile bool pollingEnabled = true;
+volatile bool requestCommandAck = true;
+bool resetAwaitingOnline;
+uint32_t resetReplyDeadline;
 
 enum Op : uint8_t {
   OP_FRAME,    ///< put one protocol frame on the wire
@@ -159,6 +159,9 @@ enum Op : uint8_t {
   OP_STARTUP,  ///< the whole wake-up sequence, expanded by the task
   OP_REFRESH,  ///< the library queries, likewise
   OP_LED,      ///< change the dedicated LED's mode
+  OP_SOURCE,   ///< change library state on the UART owner task
+  OP_SCAN,
+  OP_FOLDER,
 };
 
 struct Command {
@@ -195,12 +198,12 @@ uint8_t scanAt;        ///< folder the last 0x4E query named, 0 for none
 uint8_t scanNext;      ///< next folder to ask about, 0 when no scan is running
 bool scanComplete;     ///< a scan finished and the cache has not been dropped
 uint32_t scanSentAt;   ///< when the last scan query went out
+bool folderPending;
 
-/// The scan's own pacing. Slower than DF_COMMAND_GAP_MS deliberately: the
-/// attribution above assumes the answer to folder N arrives before the question
-/// about N+1 goes out, and 120 ms is comfortably longer than the module takes
-/// to answer a query it can answer instantly.
-constexpr uint16_t SCAN_GAP_MS = 120;
+/// MH2024K-24SS folder replies can exceed 900 ms. Allow a full 1.8 s,
+/// without needlessly delaying fast replies between successive folders.
+constexpr uint16_t SCAN_GAP_MS = 200;
+constexpr uint16_t FOLDER_REPLY_TIMEOUT_MS = 1800;
 
 /// Forgets the index. Anything that could have changed what is on the card
 /// calls this -- a source switch, a card event, a reset -- because a stale
@@ -211,6 +214,7 @@ void dropFolderIndex() {
   scanAt = 0;
   scanNext = 0;
   scanComplete = false;
+  folderPending = false;
 }
 
 bool frame(uint8_t cmd, uint16_t param = 0) {
@@ -261,7 +265,7 @@ void writeFrame(uint8_t cmd, uint16_t param) {
   buf[1] = FRAME_VERSION;
   buf[2] = FRAME_LEN;
   buf[3] = cmd;
-  buf[4] = 0;  // no ACK requested; see the note at the top
+  buf[4] = requestCommandAck && cmd < 0x40 ? 1 : 0;
   buf[5] = (uint8_t)(param >> 8);
   buf[6] = (uint8_t)(param & 0xFF);
   uint16_t sum = 0;
@@ -273,7 +277,11 @@ void writeFrame(uint8_t cmd, uint16_t param) {
   Serial2.write(buf, FRAME_SIZE);
   Serial2.flush();
   Locked lock;
-  if (lock.held) status.framesSent++;
+  if (lock.held) {
+    status.framesSent++;
+    status.lastCommand = cmd;
+  }
+  LOGF("[df] TX %02X %04X ack=%u\n", cmd, param, buf[4]);
 }
 
 /*
@@ -369,6 +377,7 @@ void applyDevices(uint16_t mask, bool present) {
 }
 
 void handleFrame(uint8_t cmd, uint16_t param) {
+  LOGF("[df] RX %02X %04X\n", cmd, param);
   {
     Locked lock;
     if (lock.held) {
@@ -380,11 +389,10 @@ void handleFrame(uint8_t cmd, uint16_t param) {
 
   switch (cmd) {
     case EV_ONLINE:
-      // The module's own start-up report, and the only place it volunteers
-      // which libraries it found. A bare 0x3F with no bits set happens on some
-      // clones; treat it as "the card, presumably", which is what it means in
-      // practice and what the following file-count query will confirm.
-      applyDevices(param ? param : DEV_SD, true);
+      resetAwaitingOnline = false;
+      // This is a complete device mask. Zero is not evidence of an SD card.
+      applyDevices(DEV_USB | DEV_SD | DEV_PC | DEV_FLASH, false);
+      applyDevices(param, true);
       setError(nullptr);
       break;
 
@@ -396,12 +404,22 @@ void handleFrame(uint8_t cmd, uint16_t param) {
                  "USB cable is unplugged");
       } else {
         setError(nullptr);
+        push(Command{OP_REFRESH, 0, 0}, 0);
       }
       break;
 
     case EV_REMOVED:
       applyDevices(param, false);
       dropFolderIndex();
+      if ((activeSource == DF_SRC_USB && (param & DEV_USB)) ||
+          (activeSource == DF_SRC_SD && (param & DEV_SD)) ||
+          (activeSource == DF_SRC_FLASH && (param & DEV_FLASH))) {
+        Locked lock;
+        if (lock.held) {
+          status.totalTracks = status.track = status.folder = 0;
+          status.folders = status.folderTracks = status.queriedFolder = 0;
+        }
+      }
       if (param & DEV_PC) setError(nullptr);
       else setError("Storage was removed while the module was using it");
       break;
@@ -431,13 +449,21 @@ void handleFrame(uint8_t cmd, uint16_t param) {
       }
       {
         Locked lock;
-        if (lock.held) status.errors++;
+        if (lock.held) {
+          status.errors++;
+          status.lastErrorCode = param;
+        }
       }
-      setError(error_text((uint8_t)(param & 0xFF)));
+      {
+        char message[72];
+        snprintf(message, sizeof(message), "0x%04X: %s", param,
+                 error_text((uint8_t)(param & 0xFF)));
+        setError(message);
+      }
       break;
 
     case EV_ACK:
-      break;  // not requested, but a module that sends one anyway is harmless
+      break;  // receipt only; status queries confirm the command's effect
 
     case Q_STATUS: {
       // High byte is the device, low byte the transport state.
@@ -511,6 +537,10 @@ void handleFrame(uint8_t cmd, uint16_t param) {
     }
 
     case Q_FOLDER_FILES: {
+      // A reply has no folder ID. Only accept it while exactly one query is
+      // outstanding, and do not move to the next folder until it arrives.
+      if (!folderPending) break;
+      folderPending = false;
       Locked lock;
       if (!lock.held) break;
       status.folderTracks = param;
@@ -518,6 +548,15 @@ void handleFrame(uint8_t cmd, uint16_t param) {
       // last query named. One task owns the wire and the module answers in
       // order, so that is the right one.
       if (scanAt >= 1 && scanAt <= DF_MAX_FOLDERS) folderCounts[scanAt - 1] = param;
+      if (scanNext) {
+        scanNext = scanAt < DF_MAX_FOLDERS ? scanAt + 1 : 0;
+        if (!scanNext) {
+          scanComplete = true;
+          status.folders = 0;
+          for (uint8_t i = 0; i < DF_MAX_FOLDERS; ++i)
+            if (folderCounts[i]) ++status.folders;
+        }
+      }
       break;
     }
 
@@ -629,10 +668,13 @@ void queueStartup(DfSource source, uint8_t volume, uint8_t eq, DfLoop loop) {
 }
 
 void queueRefresh() {
+  // Do not query 0x3F: MH2024K-24SS rejects it. Media counts and spontaneous
+  // insertion/online events provide detection without that deprecated query.
   frameNow(Q_VERSION);
   frameNow(Q_VOLUME);
   frameNow(Q_EQ);
-  frameNow(Q_FOLDERS);
+  // MH2024K returned 0x40/0x007E to this query even with 54 SD files.
+  // Derive folder totals from the folder scan instead of latching that fault.
   frameNow(Q_FILES_SD);
   frameNow(Q_FILES_USB);
   frameNow(Q_STATUS);
@@ -694,7 +736,7 @@ void driverTask(void *) {
         // this timeout run would report a deliberate standby as a dead module
         // six seconds in -- fault LED, "No module" on the OLED, and a dashboard
         // telling the owner to check wiring that is perfectly fine.
-        if (!asleep && status.online && status.lastFrameAt &&
+        if (!asleep && !resetAwaitingOnline && pollingEnabled && status.online && status.lastFrameAt &&
             millis() - status.lastFrameAt > DF_ONLINE_TIMEOUT_MS) {
           status.online = false;
           status.offlineEvents++;
@@ -733,15 +775,73 @@ void driverTask(void *) {
     }
 
     const uint32_t now = millis();
-    if ((int32_t)(now - nextSend) >= 0 &&
+    if (resetAwaitingOnline && (int32_t)(now - resetReplyDeadline) >= 0)
+      resetAwaitingOnline = false;
+    if (!resetAwaitingOnline && (int32_t)(now - nextSend) >= 0 &&
         xQueueReceive(commands, &cmd, 0) == pdTRUE) {
       switch (cmd.op) {
         case OP_FRAME:
           writeFrame(cmd.cmd, cmd.param);
+          if (cmd.cmd == CMD_RESET) {
+            // Wait for the mount/online report on slow clones. A module with
+            // no media may never send it, so keep recovery bounded at 10 s.
+            resetAwaitingOnline = true;
+            resetReplyDeadline = now + 10000;
+          }
           // A reset is not a command, it is a power cycle of the decoder: it
           // answers nothing and ignores everything until it has come back.
           nextSend = now + (cmd.cmd == CMD_RESET ? DF_RESET_SETTLE_MS
-                                                 : DF_COMMAND_GAP_MS);
+                           : cmd.cmd == CMD_SOURCE || cmd.cmd == CMD_WAKE
+                               ? DF_SOURCE_SETTLE_MS : DF_COMMAND_GAP_MS);
+          break;
+        case OP_SOURCE: {
+          activeSource = cmd.param;
+          dropFolderIndex();
+          {
+            Locked lock;
+            if (lock.held) {
+              status.source = (DfSource)cmd.param;
+              status.totalTracks = status.track = status.folder = 0;
+              status.folders = status.folderTracks = status.queriedFolder = 0;
+              status.error[0] = 0;
+            }
+          }
+          // Send here, so already queued playback cannot overtake selection.
+          writeFrame(CMD_SOURCE, cmd.param);
+          nextSend = now + DF_SOURCE_SETTLE_MS;
+          push(Command{OP_REFRESH, 0, 0}, 0);
+          break;
+        }
+        case OP_SCAN:
+          if (folderPending) {
+            setError("Folder query still pending; wait before starting a scan");
+            break;
+          }
+          dropFolderIndex();
+          scanNext = 1;
+          scanSentAt = now - SCAN_GAP_MS;
+          break;
+        case OP_FOLDER:
+          // Manual queries supersede a scan. No second unidentified query is
+          // sent while an earlier one could still be returning.
+          if (folderPending) {
+            setError("Folder query still pending; wait for it before retrying");
+            break;
+          }
+          scanNext = 0;
+          scanComplete = false;
+          scanAt = cmd.param;
+          folderPending = true;
+          scanSentAt = now;
+          {
+            Locked lock;
+            if (lock.held) {
+              status.queriedFolder = cmd.param;
+              status.folderTracks = 0;
+            }
+          }
+          writeFrame(Q_FOLDER_FILES, cmd.param);
+          nextSend = now + DF_COMMAND_GAP_MS;
           break;
         case OP_PULSE:
           if (cmd.cmd < DF_PIN_COUNT) pressPin(cmd.cmd, cmd.param);
@@ -750,6 +850,20 @@ void driverTask(void *) {
           nextSend = now + cmd.param + DF_COMMAND_GAP_MS;
           break;
         case OP_STARTUP:
+          activeSource = bootSource;
+          dropFolderIndex();
+          {
+            Locked lock;
+            if (lock.held) {
+              status.source = bootSource;
+              status.online = false;
+              status.totalTracks = status.track = status.folder = 0;
+              status.folders = status.folderTracks = status.queriedFolder = 0;
+              status.state = DF_STOPPED;
+              status.error[0] = 0;
+            }
+          }
+          liveState = DF_STOPPED;
           queueStartup(bootSource, bootVolume, bootEq, bootLoop);
           break;
         case OP_REFRESH:
@@ -768,18 +882,29 @@ void driverTask(void *) {
      * It goes first because a scan the owner asked for and is watching a
      * progress bar for should not be held up by routine polling, and it only
      * ever runs when the queue is empty, so it cannot get in the way of a
-     * command either. Ninety-nine folders at SCAN_GAP_MS is about twelve
-     * seconds; the counts appear in the dashboard as they land.
+     * command either. Each reply advances the scan; a missing reply stops it.
      */
-    if (!sleeping && scanNext && uxQueueMessagesWaiting(commands) == 0 &&
+    if (folderPending && now - scanSentAt >= FOLDER_REPLY_TIMEOUT_MS) {
+      folderPending = false;
+      scanNext = 0;
+      scanComplete = false;
+      setError("Folder query timed out; scan stopped (clone may not support it)");
+    }
+    if (!sleeping && !resetAwaitingOnline && !folderPending && scanNext && uxQueueMessagesWaiting(commands) == 0 &&
         (int32_t)(now - scanSentAt) >= (int32_t)SCAN_GAP_MS) {
-      scanAt = scanNext;
+      if ((int32_t)(now - nextSend) < 0) continue;
       scanSentAt = now;
-      frameNow(Q_FOLDER_FILES, scanAt);
-      if (++scanNext > DF_MAX_FOLDERS) {
-        scanNext = 0;
-        scanComplete = true;
+      scanAt = scanNext;
+      folderPending = true;
+      {
+        Locked lock;
+        if (lock.held) {
+          status.queriedFolder = scanAt;
+          status.folderTracks = 0;
+        }
       }
+      writeFrame(Q_FOLDER_FILES, scanAt);
+      nextSend = now + DF_COMMAND_GAP_MS;
       continue;
     }
 
@@ -787,7 +912,8 @@ void driverTask(void *) {
     // frames on a 9600 baud link at once. Nothing is asked of a module that has
     // been told to sleep: it answers queries with an error, and that error would
     // latch as a fault for as long as it stayed asleep.
-    if (!sleeping && (int32_t)(now - nextPoll) >= 0 &&
+    if (!sleeping && !resetAwaitingOnline && pollingEnabled && !folderPending && (int32_t)(now - nextSend) >= 0 &&
+        (int32_t)(now - nextPoll) >= 0 &&
         uxQueueMessagesWaiting(commands) == 0) {
       nextPoll = now + DF_POLL_MS;
       switch (pollStep++ & 0x03) {
@@ -1136,26 +1262,7 @@ bool df_player_set_source(DfSource source) {
       source != DF_SRC_FLASH) {
     return false;
   }
-  activeSource = source;
-  {
-    Locked lock;
-    if (lock.held) {
-      status.source = source;
-      // The new library's size and position are unknown until it answers, and
-      // showing the last one's counts would be a lie the picker acts on.
-      status.totalTracks = 0;
-      status.track = 0;
-      status.folder = 0;
-      status.folderTracks = 0;
-      status.queriedFolder = 0;
-    }
-  }
-  dropFolderIndex();
-  if (!frame(CMD_SOURCE, (uint16_t)source)) return false;
-  // The module needs about 200 ms after a source change before it will answer
-  // questions about the new one; the queue's own pacing covers that, and the
-  // queries are behind it.
-  return push(Command{OP_REFRESH, 0, 0});
+  return push(Command{OP_SOURCE, 0, (uint16_t)source});
 }
 
 bool df_player_set_loop(DfLoop mode, uint8_t folder) {
@@ -1199,18 +1306,6 @@ bool df_player_set_dac(bool on) {
 bool df_player_reset() {
   // `sleeping` is cleared by queueStartup() once its reset frame is queued, for
   // the reason given there -- not here, where the enqueue has not happened yet.
-  {
-    Locked lock;
-    if (lock.held) {
-      status.online = false;
-      status.totalTracks = 0;
-      status.track = 0;
-      status.state = DF_STOPPED;
-      status.error[0] = 0;
-    }
-  }
-  liveState = DF_STOPPED;
-  dropFolderIndex();
   return push(Command{OP_STARTUP, 0, 0});
 }
 
@@ -1254,27 +1349,13 @@ bool df_player_refresh() { return push(Command{OP_REFRESH, 0, 0}); }
 
 bool df_player_query_folder(uint8_t folder) {
   if (folder < 1 || folder > DF_MAX_FOLDERS) return false;
-  {
-    Locked lock;
-    if (lock.held) {
-      status.queriedFolder = folder;
-      status.folderTracks = 0;
-    }
-  }
-  // Also the folder the next 0x4E reply belongs to. A one-off query and the
-  // scan use the same field because they use the same command, and the scan
-  // only advances when the queue is empty, so the two cannot interleave.
-  scanAt = folder;
-  return frame(Q_FOLDER_FILES, folder);
+  return push(Command{OP_FOLDER, 0, folder});
 }
 
 // ----------------------------------------------------------- folder index ---
 bool df_player_scan() {
   if (!running) return false;
-  dropFolderIndex();
-  scanNext = 1;
-  scanSentAt = millis() - SCAN_GAP_MS;  // start on the next pass, not in 120 ms
-  return true;
+  return push(Command{OP_SCAN, 0, 0});
 }
 
 bool df_player_scanning(uint8_t *done, uint8_t *total) {
@@ -1370,6 +1451,29 @@ bool df_player_command(const char *line) {
   if (!running) {
     LOGLN("[df] the DFPlayer driver is not running in this mode; "
                    "type 'sd' to switch to DFPlayer mode");
+    return true;
+  }
+
+  // Development console tools for testing a clone without routine queries
+  // interleaving its delayed replies. Hexadecimal command and parameter.
+  if (!strcmp(arg, "polling off") || !strcmp(arg, "polling on")) {
+    pollingEnabled = !strcmp(arg, "polling on");
+    LOGF("[df] polling %s\n", pollingEnabled ? "on" : "off");
+    return true;
+  }
+  if (!strcmp(arg, "ack off") || !strcmp(arg, "ack on")) {
+    requestCommandAck = !strcmp(arg, "ack on");
+    LOGF("[df] control ACK %s\n", requestCommandAck ? "on" : "off");
+    return true;
+  }
+  if (!strncmp(arg, "raw ", 4)) {
+    unsigned command = 0, parameter = 0;
+    const int fields = sscanf(arg + 4, "%x %x", &command, &parameter);
+    if (fields < 1 || command > 255 || parameter > 65535) {
+      LOGLN("[df] usage: df raw COMMAND_HEX [PARAMETER_HEX]");
+    } else if (!frame((uint8_t)command, (uint16_t)parameter)) {
+      LOGLN("[df] command queue full");
+    }
     return true;
   }
 

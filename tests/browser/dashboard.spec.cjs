@@ -80,3 +80,20 @@ test('firmware uploads use bounded raw binary transport',async({page})=>{
   await page.locator('#uploadFirmware').click();await page.locator('#acceptConfirm').click();
   await expect.poll(()=>commands.find(c=>c.path==='/api/update/upload')).toMatchObject({contentType:'application/octet-stream',bytes:256});
 });
+
+
+test('clone media selection stays available without insertion notifications',async({page})=>{
+  const {state,commands,errors}=await speaker(page,'wroom');
+  state.mode={id:2,dfplayer:true,dfBuilt:true};
+  state.dfplayer={running:true,online:true,source:2,reported:2,sourceName:'SD card',sd:false,usb:false,state:'stopped',volume:10,framesSent:20,framesGood:15,errors:3,pins:{}};
+  await page.evaluate(()=>refresh());
+  await expect(page.locator('[data-dfsource="usb"]')).toBeEnabled();
+  await page.locator('#nav [data-page="media"]').click();
+  await expect(page.locator('#dfHealth')).toContainText('TX 20');
+  await page.locator('[data-dfsrc="usb"]').click();
+  expect(commands.some(c=>c.path==='/api/dfplayer'&&c.action==='source'&&c.value==='usb')).toBeTruthy();
+  state.dfplayer.source=1;state.dfplayer.sourceName='USB drive';
+  await page.evaluate(()=>refresh());
+  await expect(page.locator('#dfSourceCheck')).toContainText('selection may have failed');
+  expect(errors).toEqual([]);
+});

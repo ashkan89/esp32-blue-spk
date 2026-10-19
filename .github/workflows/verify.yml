@@ -25,6 +25,7 @@ jobs:
       - run: npx playwright install chromium
       - run: npm test
       - run: python scripts/test_native.py
+      - run: python scripts/test_dfplayer.py
       - run: python scripts/test_led_output.py
       - run: python scripts/test_update_memory.py
       - run: python scripts/test_release_package.py

@@ -281,9 +281,10 @@ static const uint16_t DF_ADKEY_PRESS_MS = 200;
 
 /// Minimum gap between two frames on the wire. The YX5200 drops commands that
 /// arrive while it is still acting on the last one, and answers 0x40/0x01
-/// ("module busy") when it notices. 40 ms is comfortable; below ~25 ms the
-/// module starts missing volume steps.
-static const uint16_t DF_COMMAND_GAP_MS = 40;
+/// ("module busy") when it notices. Use a conservative gap for clone firmware.
+static const uint16_t DF_COMMAND_GAP_MS = 150;
+// Clones need time to mount a new volume before transport/query commands.
+static const uint16_t DF_SOURCE_SETTLE_MS = 1000;
 
 /// How often the driver asks the module what it is doing. Every poll is two
 /// frames on a 9600 baud link, so this is not free -- but it is the only way to
